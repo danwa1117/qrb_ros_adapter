@@ -476,6 +476,145 @@ private:
   }
 };
 
+// --- sensor.v1.ImageLayout (DMA-BUF) ------------------------------------------
+
+/**
+ * A kProbeImageWidth x ProbeImageHeight( payload_bytes ) rgb8 Camera frame,
+ * whose rows are kProbeImageHcmStride apart as the QCNode Camera sample
+ * allocates them. Its timestamp is the camera qtimer, which the Adapter
+ * converts to and from ROS time.
+ */
+template <>
+struct HcmProbeSample<adapter::ImageHcmDescriptor>
+{
+  using Descriptor = adapter::ImageHcmDescriptor;
+  /** @brief How far a received timestamp may be from the qtimer now. */
+  static constexpr std::uint64_t kStampToleranceNs = 5000000000ull;
+
+  static std::string CheckPayloadBytes(std::uint64_t payloadBytes)
+  {
+    if (ProbeImageHeight(payloadBytes) > 0)
+      return {};
+    return "'payload_bytes' of ImageLayout must hold at least one row of " +
+           std::to_string(kProbeImageHcmStride) + " bytes";
+  }
+
+  static std::uint64_t SentBytes(const HcmSenderState & state)
+  {
+    return kProbeImageRowBytes * ProbeImageHeight(state.payloadBytes);
+  }
+
+  static HcmStampResult Stamp(Descriptor & image, HcmSenderState & state, std::uint64_t sequence)
+  {
+    const std::uint32_t height = ProbeImageHeight(state.payloadBytes);
+    const std::uint64_t storage = kProbeImageHcmStride * height;
+    if (image.pBuf == nullptr || image.offset > image.size || image.size - image.offset < storage)
+      return HcmStampResult::kBadBuffer;
+    auto * data = static_cast<std::uint8_t *>(image.GetDataPtr());
+    int fd = -1;
+    if (!LocalBufferFd(image, fd))
+      return HcmStampResult::kBadBuffer;
+
+    image.format = QC::QC_IMAGE_FORMAT_RGB888;
+    image.width = kProbeImageWidth;
+    image.height = height;
+    image.batchSize = 1;
+    image.numPlanes = 1;
+    for (std::uint32_t i = 0; i < QC_NUM_IMAGE_PLANES; ++i) {
+      image.stride[i] = 0;
+      image.actualHeight[i] = 0;
+      image.planeBufSize[i] = 0;
+    }
+    image.stride[0] = static_cast<std::uint32_t>(kProbeImageHcmStride);
+    image.actualHeight[0] = height;
+    image.planeBufSize[0] = static_cast<std::uint32_t>(storage);
+    const ProbeImageLayout layout = LayoutOf(image);
+
+    if (adapter::BeginDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+    if (state.patternedBytes != storage) {
+      state.patterned = {};
+      state.patternedBytes = static_cast<std::size_t>(storage);
+    }
+    if (std::find(state.patterned.begin(), state.patterned.end(), data) == state.patterned.end()) {
+      FillImagePattern(data, layout, state.streamTag);
+      state.patterned[state.nextPatterned] = data;
+      state.nextPatterned = (state.nextPatterned + 1) % state.patterned.size();
+    }
+    const std::uint64_t now = MonotonicNowNs();
+    state.lastSendNs = now;
+    StampImage(data, layout, state.streamTag, sequence, now);
+    if (adapter::EndDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+
+    image.validSize = static_cast<std::size_t>(storage);
+    image.timestamp = adapter::SampleHcmClocks().qtimerNs;
+    image.timestampQGPTP = 0;
+    image.flags = 0;
+    return HcmStampResult::kOk;
+  }
+
+  static FrameReading Check(const Descriptor & image,
+      std::uint32_t streamTag,
+      std::uint64_t & payloadBytes)
+  {
+    const ProbeImageLayout layout = LayoutOf(image);
+    payloadBytes = layout.LogicalBytes();
+    FrameReading reading;
+    if (image.pBuf == nullptr || image.offset > image.size ||
+        image.validSize > image.size - image.offset || layout.planeCount == 0 ||
+        StorageEnd(layout) > image.validSize)
+      return reading;
+
+    int fd = -1;
+    if (!LocalBufferFd(image, fd) || adapter::BeginDmaBufCpuRead(fd) != adapter::Status::kOk)
+      return reading;
+    reading = CheckImage(static_cast<const std::uint8_t *>(image.GetDataPtr()), layout, streamTag);
+    const bool ended = adapter::EndDmaBufCpuRead(fd) == adapter::Status::kOk;
+    if (reading.check != FrameCheck::kOk)
+      return reading;
+    if (!ended) {
+      reading.check = FrameCheck::kBadPayload;
+      return reading;
+    }
+    // The sender is the ROS probe: its rgb8 image, stamped with ROS time, which
+    // the Adapter converted to the qtimer.
+    if (image.format != QC::QC_IMAGE_FORMAT_RGB888 || image.width != kProbeImageWidth ||
+        !WithinNs(image.timestamp, adapter::SampleHcmClocks().qtimerNs, kStampToleranceNs))
+      reading.check = FrameCheck::kBadLayout;
+    return reading;
+  }
+
+private:
+  /** @brief The valid rows of `image` in the layout its descriptor describes. */
+  static ProbeImageLayout LayoutOf(const Descriptor & image)
+  {
+    ProbeImageLayout layout;
+    const bool nv12 = image.format == QC::QC_IMAGE_FORMAT_NV12;
+    const bool rgb =
+        image.format == QC::QC_IMAGE_FORMAT_RGB888 || image.format == QC::QC_IMAGE_FORMAT_BGR888;
+    if ((!nv12 && !rgb) || image.numPlanes != (nv12 ? 2u : 1u))
+      return layout;
+    layout.planeCount = image.numPlanes;
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < layout.planeCount; ++i) {
+      layout.planes[i] = {offset, image.stride[i], rgb ? image.width * 3ull : image.width,
+          i == 0 ? image.height : image.height / 2ull};
+      offset += image.planeBufSize[i] != 0 ? image.planeBufSize[i] :
+                                             std::uint64_t{image.stride[i]} * image.actualHeight[i];
+    }
+    return layout;
+  }
+
+  /** @brief One past the last valid byte of `layout`. */
+  static std::uint64_t StorageEnd(const ProbeImageLayout & layout)
+  {
+    const ProbeImagePlane & last = layout.planes[layout.planeCount - 1];
+    return last.rows == 0 ? last.offset :
+                            last.offset + last.stride * (last.rows - 1) + last.rowBytes;
+  }
+};
+
 namespace
 {
 

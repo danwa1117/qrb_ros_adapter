@@ -7,6 +7,7 @@
 #include <string>
 
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_converters.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/pose_hcm_converter.hpp"
@@ -92,4 +93,15 @@ TEST(HcmContractBinding, EveryContractHasOneCompleteBindingAndAMatchingFactory)
   EXPECT_FALSE(twist.acceptsDescriptor(tfDescriptor));
   EXPECT_FALSE(tf.contractToHcm(tfContract, DmaBufView{}, twistDescriptor));
   EXPECT_FALSE(tf.hcmToContract(twistDescriptor, tfContract));
+
+  // Image and PointCloud are both DMA-BUF Buffer descriptors; neither takes the other's.
+  const HcmContractBinding & image = *FindHcmContractBinding(kImageContractType);
+  const HcmContractBinding & cloud = *FindHcmContractBinding(kPointCloudContractType);
+  ImageHcmDescriptor imageDescriptor;
+  ImageHcmContract imageContract;
+  EXPECT_TRUE(image.acceptsDescriptor(imageDescriptor));
+  EXPECT_FALSE(image.acceptsDescriptor(cloudDescriptor));
+  EXPECT_FALSE(cloud.acceptsDescriptor(imageDescriptor));
+  EXPECT_FALSE(image.contractToHcm(imageContract, DmaBufView{}, cloudDescriptor));
+  EXPECT_FALSE(image.hcmToContract(cloudDescriptor, imageContract));
 }

@@ -5,6 +5,7 @@
 // expanded independently by the shared, HCM and ROS registries.
 
 #if defined( QRB_CONTRACT_MAPPING_INCLUDE_HCM_HEADERS )
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/pose_hcm_converter.hpp"
@@ -13,6 +14,7 @@
 #endif
 
 #if defined( QRB_CONTRACT_MAPPING_INCLUDE_ROS_HEADERS )
+#include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/image_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/odometry_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/point_cloud_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/pose_ros_converter.hpp"
@@ -52,4 +54,10 @@ QRB_CONTRACT_MAPPING( TFMessage,
     ::qrb::contract::tf2::v1::TFMessage,
     ::qrb::adapter::TFMessageHcmDescriptor,
     ::qrb::adapter::TFMessageRosMessage, "tf_message_bridge" )
+
+QRB_CONTRACT_MAPPING( Image,
+    "qrb.contract.sensor.v1.ImageLayout", DmaBuf,
+    ::qrb::contract::sensor::v1::ImageLayout,
+    ::qrb::adapter::ImageHcmDescriptor,
+    ::qrb::adapter::ImageRosMessage, "image_bridge" )
 #endif

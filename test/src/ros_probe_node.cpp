@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include "qrb_ros_transport_image_type/image_utils.hpp"
+
 namespace qrb::adapter::stream_probe
 {
 
@@ -341,8 +343,15 @@ public:
     std::unique_ptr<DmaMapping> mapping;
   };
 
-  DmaPayloadPool(std::size_t bytes, std::size_t capacity, std::uint32_t streamTag)
-    : bytes_(bytes), capacity_(capacity), streamTag_(streamTag), state_(std::make_shared<State>())
+  /** @brief Writes the pattern into a new buffer; by default over all its bytes. */
+  using Fill = std::function<void(std::uint8_t *)>;
+
+  DmaPayloadPool(std::size_t bytes, std::size_t capacity, std::uint32_t streamTag, Fill fill = {})
+    : bytes_(bytes)
+    , capacity_(capacity)
+    , streamTag_(streamTag)
+    , fill_(std::move(fill))
+    , state_(std::make_shared<State>())
   {
   }
 
@@ -405,7 +414,10 @@ private:
     slot->mapping = std::make_unique<DmaMapping>(slot->buffer->fd(), bytes_, true);
     if (!slot->mapping->Valid() || !slot->mapping->BeginAccess())
       return nullptr;
-    FillPattern(slot->mapping->Data(), bytes_, streamTag_);
+    if (fill_)
+      fill_(slot->mapping->Data());
+    else
+      FillPattern(slot->mapping->Data(), bytes_, streamTag_);
     if (!slot->mapping->EndAccess())
       return nullptr;
     return slot;
@@ -414,6 +426,7 @@ private:
   std::size_t bytes_;
   std::size_t capacity_;
   std::uint32_t streamTag_;
+  Fill fill_;
   std::size_t allocated_{0};  // touched by the sending thread only
   std::shared_ptr<State> state_;
 };
@@ -541,6 +554,166 @@ private:
         return false;
     }
     return true;
+  }
+};
+
+// --- sensor.v1.ImageLayout (DMA-BUF) ------------------------------------------
+
+/**
+ * A kProbeImageWidth x ProbeImageHeight( payload_bytes ) rgb8 image in the
+ * layout qrb_ros_transport allocates, taken from qrb_ros_transport itself so
+ * the Adapter's copy of that rule is checked too. Its stamp is ROS time, which
+ * the Adapter converts to and from the camera qtimer.
+ */
+template <>
+struct RosProbeSample<adapter::ImageRosMessage>
+{
+  using Message = adapter::ImageRosMessage;
+  static constexpr const char * kEncoding = "rgb8";
+  /** @brief How far a received stamp may be from ROS time now. */
+  static constexpr std::uint64_t kStampToleranceNs = 5000000000ull;
+
+  class Source
+  {
+  public:
+    Source(std::uint64_t payloadBytes, std::uint32_t depth, std::uint32_t streamTag)
+      : streamTag_(streamTag)
+      , height_(ProbeImageHeight(payloadBytes))
+      , layout_(TransportLayout(kProbeImageWidth, height_, kEncoding))
+      , pool_(StorageBytes(kProbeImageWidth, height_, kEncoding),
+            depth + 4u,
+            streamTag,
+            [layout = layout_, streamTag](
+                std::uint8_t * data) { FillImagePattern(data, layout, streamTag); })
+    {
+      if (height_ == 0)
+        throw std::invalid_argument(
+            "'payload_bytes' of ImageLayout must hold at least one row of " +
+            std::to_string(kProbeImageHcmStride) + " bytes");
+      std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buffer;
+      DmaPayloadPool::Slot * slot = nullptr;
+      if (pool_.Acquire(buffer, slot) != SendOutcome::kSent)
+        throw std::runtime_error(
+            std::string("cannot allocate a DMA-BUF from ") + DmaPayloadPool::kHeap);
+    }
+
+    SendOutcome Next(std::uint64_t sequence,
+        std::unique_ptr<Message> & out,
+        std::uint64_t & sendTimeNs)
+    {
+      std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buffer;
+      DmaPayloadPool::Slot * slot = nullptr;
+      const SendOutcome acquired = pool_.Acquire(buffer, slot);
+      if (acquired != SendOutcome::kSent)
+        return acquired;
+
+      auto image = std::make_unique<Message>(Message());
+      image->width = static_cast<int>(kProbeImageWidth);
+      image->height = static_cast<int>(height_);
+      image->encoding = kEncoding;
+      image->dmabuf = std::move(buffer);
+
+      if (!slot->mapping->BeginAccess())
+        return SendOutcome::kError;
+      const std::uint64_t now = MonotonicNowNs();
+      sendTimeNs = now;
+      StampImage(slot->mapping->Data(), layout_, streamTag_, sequence, now);
+      if (!slot->mapping->EndAccess())
+        return SendOutcome::kError;
+      // ROS time: the HCM side converts it to the camera qtimer.
+      const std::uint64_t stamp = RealtimeNowNs();
+      image->header.stamp.sec = static_cast<std::int32_t>(stamp / 1000000000ull);
+      image->header.stamp.nanosec = static_cast<std::uint32_t>(stamp % 1000000000ull);
+      out = std::move(image);
+      return SendOutcome::kSent;
+    }
+
+    std::uint64_t PayloadBytes() const { return layout_.LogicalBytes(); }
+
+  private:
+    std::uint32_t streamTag_;
+    std::uint32_t height_;
+    ProbeImageLayout layout_;
+    DmaPayloadPool pool_;
+  };
+
+  static FrameReading Check(const Message & image,
+      std::uint32_t streamTag,
+      std::uint64_t & payloadBytes)
+  {
+    FrameReading reading;
+    payloadBytes = 0;
+    if (image.width <= 0 || image.height <= 0 ||
+        !qrb_ros::transport::image_utils::is_support_encoding(image.encoding))
+      return reading;
+    const ProbeImageLayout layout = TransportLayout(static_cast<std::uint32_t>(image.width),
+        static_cast<std::uint32_t>(image.height), image.encoding);
+    const std::uint64_t storage = StorageBytes(static_cast<std::uint32_t>(image.width),
+        static_cast<std::uint32_t>(image.height), image.encoding);
+    payloadBytes = layout.LogicalBytes();
+    if (image.dmabuf == nullptr || image.dmabuf->fd() < 0 ||
+        storage > static_cast<std::uint64_t>(image.dmabuf->size()))
+      return reading;
+
+    DmaMapping mapping(image.dmabuf->fd(), static_cast<std::size_t>(storage), false);
+    if (!mapping.Valid() || !mapping.BeginAccess())
+      return reading;
+    reading = CheckImage(mapping.Data(), layout, streamTag);
+    const bool ended = mapping.EndAccess();
+    if (reading.check != FrameCheck::kOk)
+      return reading;
+    if (!ended) {
+      reading.check = FrameCheck::kBadPayload;
+      return reading;
+    }
+    // The sender is the HCM probe: a Camera frame, which has no frame ID, whose
+    // qtimer the Adapter converted to ROS time.
+    const std::uint64_t stamp = static_cast<std::uint64_t>(image.header.stamp.sec) * 1000000000ull +
+                                image.header.stamp.nanosec;
+    if (image.encoding != kEncoding || image.width != static_cast<int>(kProbeImageWidth) ||
+        !image.header.frame_id.empty() || image.header.stamp.sec < 0 ||
+        !WithinNs(stamp, RealtimeNowNs(), kStampToleranceNs))
+      reading.check = FrameCheck::kBadLayout;
+    return reading;
+  }
+
+private:
+  static std::uint64_t RealtimeNowNs()
+  {
+    timespec now{};
+    clock_gettime(CLOCK_REALTIME, &now);
+    return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ull +
+           static_cast<std::uint64_t>(now.tv_nsec);
+  }
+
+  static std::uint64_t StorageBytes(std::uint32_t width,
+      std::uint32_t height,
+      const std::string & encoding)
+  {
+    return static_cast<std::uint64_t>(qrb_ros::transport::image_utils::get_image_align_size(
+        static_cast<int>(width), static_cast<int>(height), encoding));
+  }
+
+  /** @brief The valid rows of an image in the qrb_ros_transport layout. */
+  static ProbeImageLayout TransportLayout(std::uint32_t width,
+      std::uint32_t height,
+      const std::string & encoding)
+  {
+    namespace utils = qrb_ros::transport::image_utils;
+    ProbeImageLayout layout;
+    const auto stride =
+        static_cast<std::uint64_t>(utils::get_image_stride(static_cast<int>(width), encoding));
+    if (encoding == "nv12") {
+      layout.planeCount = 2;
+      layout.planes[0] = {0, stride, width, height};
+      layout.planes[1] = {
+          stride * static_cast<std::uint64_t>(utils::align_height(static_cast<int>(height))),
+          stride, width, height / 2ull};
+    } else {
+      layout.planeCount = 1;
+      layout.planes[0] = {0, stride, width * 3ull, height};
+    }
+    return layout;
   }
 };
 

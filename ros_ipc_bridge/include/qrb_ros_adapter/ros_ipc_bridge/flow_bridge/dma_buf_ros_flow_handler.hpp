@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <lib_mem_dmabuf/dmabuf.hpp>
 #include <limits>
 #include <memory>
@@ -142,8 +143,7 @@ protected:
     }
 
     std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buffer;
-    Status copied = CopyToRosBuffer(
-        payload, static_cast<std::size_t>(conversionPayload.Size()), buffer, diagnostic);
+    Status copied = CopyToRosBuffer(payload, conversionPayload, buffer, diagnostic);
     if (copied != Status::kOk)
       return copied;
 
@@ -156,13 +156,23 @@ protected:
   }
 
 private:
+  /**
+   * @brief Copy the received payload into a pool buffer the ROS message owns.
+   *
+   * Without a region plan the destination mirrors the received range and is
+   * copied flat. With one, the destination size is independent of the received
+   * range: the allocation is zeroed and only the planned valid rows are copied, so
+   * padding never carries a previous frame's data.
+   */
   Status CopyToRosBuffer(InboundPayload & payload,
-      std::size_t size,
+      const ContractToRosPayload & conversionPayload,
       std::shared_ptr<lib_mem_dmabuf::DmaBuffer> & destination,
       std::string & diagnostic)
   {
+    const std::size_t size = static_cast<std::size_t>(conversionPayload.Size());
+    const bool repack = conversionPayload.RegionCount() != 0;
     if (pool_ == nullptr || size == 0 || payload.offset > payload.capacity ||
-        size > payload.capacity - payload.offset) {
+        (!repack && size > payload.capacity - payload.offset)) {
       diagnostic += "invalid inbound DMA-BUF size or unavailable ROS buffer pool; ";
       return Status::kBadState;
     }
@@ -186,10 +196,33 @@ private:
     }
 
     auto * sourceBytes = static_cast<std::uint8_t *>(source->addr());
-    const bool copied = destination->set_data(sourceBytes + payload.offset, size);
+    // set_data() maps the destination itself; the repack path keeps the mapping
+    // open across the per-row copies, so it maps and synchronizes explicitly.
+    bool copied = false;
+    bool destinationMapped = false;
+    if (!repack) {
+      copied = destination->set_data(sourceBytes + payload.offset, size);
+      destinationMapped = true;
+    } else if (destination->map()) {
+      destinationMapped = true;
+      if (destination->sync_start()) {
+        auto * destinationBytes = static_cast<std::uint8_t *>(destination->addr());
+        std::memset(destinationBytes, 0, size);
+        for (std::size_t index = 0; index < conversionPayload.RegionCount(); ++index) {
+          const PayloadCopyRegion & region = conversionPayload.RegionAt(index);
+          const std::uint8_t * from = sourceBytes + payload.offset + region.sourceOffset;
+          std::uint8_t * to = destinationBytes + region.destinationOffset;
+          for (std::uint64_t row = 0; row < region.rows; ++row) {
+            std::memcpy(to + row * region.destinationStride, from + row * region.sourceStride,
+                static_cast<std::size_t>(region.rowBytes));
+          }
+        }
+        copied = destination->sync_end();
+      }
+    }
     const bool sourceSyncEnded = source->sync_end();
     const bool sourceUnmapped = source->unmap();
-    const bool destinationUnmapped = destination->unmap();
+    const bool destinationUnmapped = !destinationMapped || destination->unmap();
     if (!copied || !sourceSyncEnded || !sourceUnmapped || !destinationUnmapped) {
       diagnostic += "failed to copy or synchronize the ROS-owned DMA-BUF; ";
       destination.reset();

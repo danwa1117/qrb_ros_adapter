@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -215,6 +216,133 @@ inline FrameReading CheckFrame(const std::uint8_t * data, std::size_t size, std:
   }
   reading.check = FrameCheck::kOk;
   return reading;
+}
+
+// --- image payloads ------------------------------------------------------------
+
+//
+// The payload of an image is its valid bytes, row after row and plane after
+// plane, as a byte payload above. Each side lays those rows out at its own
+// stride: the HCM probe as the QCNode Camera sample allocates rgb8, the ROS
+// probe as qrb_ros_transport does. So the check covers the repack between the
+// two as well as the bytes.
+//
+
+/** @brief Width of a probe image: not a multiple of 128, so the two sides' strides differ. */
+constexpr std::uint32_t kProbeImageWidth = 1928;
+constexpr std::uint64_t kProbeImageRowBytes = kProbeImageWidth * 3;  // rgb8
+/** @brief The HCM row stride, ALIGN(width * 3, 16) as the QCNode Camera sample uses for rgb8. */
+constexpr std::uint64_t kProbeImageHcmStride = (kProbeImageRowBytes + 15) / 16 * 16;
+
+/** @brief Rows of a probe image whose HCM storage fits `payloadBytes`; 0 if none fits. */
+inline std::uint32_t ProbeImageHeight(std::uint64_t payloadBytes)
+{
+  return static_cast<std::uint32_t>(payloadBytes / kProbeImageHcmStride);
+}
+
+/** @brief Where the valid rows of one plane lie in a buffer. */
+struct ProbeImagePlane
+{
+  std::uint64_t offset{0};
+  std::uint64_t stride{0};
+  std::uint64_t rowBytes{0};
+  std::uint64_t rows{0};
+};
+
+struct ProbeImageLayout
+{
+  std::array<ProbeImagePlane, 2> planes{};
+  std::size_t planeCount{0};
+
+  std::uint64_t LogicalBytes() const
+  {
+    std::uint64_t bytes = 0;
+    for (std::size_t i = 0; i < planeCount; ++i)
+      bytes += planes[i].rowBytes * planes[i].rows;
+    return bytes;
+  }
+};
+
+/**
+ * @brief Call `span( at, logical, count )` for each run of the `size` payload
+ * bytes at logical `offset`: `count` bytes at `at` in `data`, starting at
+ * payload offset `logical`.
+ */
+template <typename Byte>
+inline void ForEachImageSpan(Byte * data,
+    const ProbeImageLayout & layout,
+    std::uint64_t offset,
+    std::uint64_t size,
+    const std::function<void(Byte *, std::uint64_t, std::uint64_t)> & span)
+{
+  std::uint64_t logical = 0;
+  for (std::size_t p = 0; p < layout.planeCount && size > 0; ++p) {
+    const ProbeImagePlane & plane = layout.planes[p];
+    for (std::uint64_t row = 0; row < plane.rows && size > 0; ++row, logical += plane.rowBytes) {
+      if (offset >= logical + plane.rowBytes)
+        continue;
+      const std::uint64_t inRow = offset - logical;
+      const std::uint64_t count = std::min(size, plane.rowBytes - inRow);
+      span(data + plane.offset + row * plane.stride + inRow, offset, count);
+      offset += count;
+      size -= count;
+    }
+  }
+}
+
+/** @brief Write the pattern of `streamTag` into the valid rows, once per allocation. */
+inline void FillImagePattern(std::uint8_t * data,
+    const ProbeImageLayout & layout,
+    std::uint32_t streamTag)
+{
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(layout.LogicalBytes()));
+  FillPattern(payload.data(), payload.size(), streamTag);
+  ForEachImageSpan<std::uint8_t>(data, layout, 0, payload.size(),
+      [&payload](std::uint8_t * at, std::uint64_t logical, std::uint64_t count) {
+        std::memcpy(at, payload.data() + logical, static_cast<std::size_t>(count));
+      });
+}
+
+/** @brief Stamp frame `sequence` into an image whose rows hold the pattern. */
+inline void StampImage(std::uint8_t * data,
+    const ProbeImageLayout & layout,
+    std::uint32_t streamTag,
+    std::uint64_t sequence,
+    std::uint64_t sendTimeNs)
+{
+  const ProbeHeader header{kProbeMagic, streamTag, sequence, sendTimeNs};
+  const std::uint64_t sentinel = SentinelWord(streamTag, sequence);
+  const auto * headerBytes = reinterpret_cast<const std::uint8_t *>(&header);
+  const auto * sentinelBytes = reinterpret_cast<const std::uint8_t *>(&sentinel);
+  const std::uint64_t sentinelOffset = layout.LogicalBytes() - kSentinelBytes;
+  ForEachImageSpan<std::uint8_t>(data, layout, 0, sizeof(header),
+      [&](std::uint8_t * at, std::uint64_t logical, std::uint64_t count) {
+        std::memcpy(at, headerBytes + logical, static_cast<std::size_t>(count));
+      });
+  ForEachImageSpan<std::uint8_t>(data, layout, sentinelOffset, kSentinelBytes,
+      [&](std::uint8_t * at, std::uint64_t logical, std::uint64_t count) {
+        std::memcpy(
+            at, sentinelBytes + (logical - sentinelOffset), static_cast<std::size_t>(count));
+      });
+}
+
+/** @brief Gather the valid rows and check them as a byte payload. */
+inline FrameReading CheckImage(const std::uint8_t * data,
+    const ProbeImageLayout & layout,
+    std::uint32_t streamTag)
+{
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(layout.LogicalBytes()));
+  ForEachImageSpan<const std::uint8_t>(data, layout, 0, payload.size(),
+      [&payload](const std::uint8_t * at, std::uint64_t logical, std::uint64_t count) {
+        std::memcpy(payload.data() + logical, at, static_cast<std::size_t>(count));
+      });
+  return CheckFrame(payload.data(), payload.size(), streamTag);
+}
+
+/** @brief Whether two clock readings in nanoseconds are within `toleranceNs`. */
+inline bool WithinNs(std::uint64_t a, std::uint64_t b, std::uint64_t toleranceNs)
+{
+  return (a > b ? a - b : b - a) <= toleranceNs;
 }
 
 // --- inline payloads -----------------------------------------------------------

@@ -47,6 +47,7 @@ foreach(_msg_dependency IN LISTS QRB_ROS_MSG_DEPENDENCIES)
 endforeach()
 # qrb_ros_transport types of the DmaBuf Contracts; also list them in package.xml.
 set(QRB_ROS_TRANSPORT_DEPENDENCIES
+  qrb_ros_transport_image_type
   qrb_ros_transport_point_cloud2_type)
 foreach(_transport_dependency IN LISTS QRB_ROS_TRANSPORT_DEPENDENCIES)
   find_package(${_transport_dependency} REQUIRED)
