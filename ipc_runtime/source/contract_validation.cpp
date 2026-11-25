@@ -105,6 +105,94 @@ std::uint32_t PointFieldElementSize(qrb::contract::sensor::v1::PointFieldType ty
   }
 }
 
+bool IsNonNegative(double value)
+{
+  return std::isfinite(value) && value >= 0.0;
+}
+
+std::string DetectionFailure(int index, const char * message)
+{
+  return "detection " + std::to_string(index) + ": " + message;
+}
+
+ConversionResult ValidateDetectionString(const std::string & value, const char * name)
+{
+  if (value.size() > contract_limits::kMaxDetectionStringLength)
+    return Fail((std::string(name) + " exceeds the contract limit").c_str());
+  if (value.find('\0') != std::string::npos)
+    return Fail((std::string(name) + " must not contain NUL").c_str());
+  return ConversionResult::Success();
+}
+
+ConversionResult ValidateHypothesis(
+    const qrb::contract::vision::v1::ObjectHypothesisWithPose & result)
+{
+  if (!result.has_hypothesis())
+    return Fail("hypothesis is required");
+  ConversionResult classId = ValidateDetectionString(result.hypothesis().class_id(), "class_id");
+  if (!classId)
+    return classId;
+  if (!std::isfinite(result.hypothesis().score()))
+    return Fail("hypothesis score must be finite");
+  // The pose is optional: an absent one reads as the identity with unknown covariance.
+  if (!result.has_pose())
+    return ConversionResult::Success();
+  if (!IsFinitePose(result.pose().pose()))
+    return Fail("hypothesis pose contains non-finite values");
+  return ValidateCovariance(result.pose().covariance(),
+      "hypothesis covariance must be empty or contain 36 values",
+      "hypothesis covariance contains a non-finite value");
+}
+
+ConversionResult ValidateBox(const qrb::contract::vision::v1::BoundingBox2D & box)
+{
+  const auto & center = box.center();
+  if (!std::isfinite(center.position().x()) || !std::isfinite(center.position().y()) ||
+      !std::isfinite(center.theta()))
+    return Fail("bbox center contains non-finite values");
+  if (!IsNonNegative(box.size_x()) || !IsNonNegative(box.size_y()))
+    return Fail("bbox size must be finite and not negative");
+  return ConversionResult::Success();
+}
+
+ConversionResult ValidateBox(const qrb::contract::vision::v1::BoundingBox3D & box)
+{
+  if (!IsFinitePose(box.center()))
+    return Fail("bbox center contains non-finite values");
+  if (!IsFiniteVector3(box.size()) || !IsNonNegative(box.size().x()) ||
+      !IsNonNegative(box.size().y()) || !IsNonNegative(box.size().z()))
+    return Fail("bbox size must be finite and not negative");
+  return ConversionResult::Success();
+}
+
+/** @brief The checks Detection2DArray and Detection3DArray share. */
+template <typename ArrayT>
+ConversionResult ValidateDetectionArray(const ArrayT & array)
+{
+  ConversionResult header = ValidateHeader(array.header());
+  if (!header)
+    return header;
+  int index = 0;
+  for (const auto & detection : array.detections()) {
+    ConversionResult id = ValidateDetectionString(detection.id(), "id");
+    if (!id)
+      return ConversionResult::Failure(DetectionFailure(index, id.Diagnostic().c_str()));
+    if (!detection.has_bbox())
+      return ConversionResult::Failure(DetectionFailure(index, "bbox is required"));
+    ConversionResult box = ValidateBox(detection.bbox());
+    if (!box)
+      return ConversionResult::Failure(DetectionFailure(index, box.Diagnostic().c_str()));
+    for (const auto & result : detection.results()) {
+      ConversionResult hypothesis = ValidateHypothesis(result);
+      if (!hypothesis) {
+        return ConversionResult::Failure(DetectionFailure(index, hypothesis.Diagnostic().c_str()));
+      }
+    }
+    ++index;
+  }
+  return ConversionResult::Success();
+}
+
 }  // namespace
 
 ConversionResult ValidateFrameId(const std::string & frameId)
@@ -197,6 +285,37 @@ ConversionResult ValidateTFMessage(const qrb::contract::tf2::v1::TFMessage & mes
       return ConversionResult::Failure(where + "transform contains non-finite values");
     if (rotation.x() == 0.0 && rotation.y() == 0.0 && rotation.z() == 0.0 && rotation.w() == 0.0)
       return ConversionResult::Failure(where + "rotation quaternion must be non-zero");
+  }
+  return ConversionResult::Success();
+}
+
+ConversionResult ValidateJointState(const qrb::contract::sensor::v1::JointState & message)
+{
+  ConversionResult header = ValidateHeader(message.header());
+  if (!header)
+    return header;
+  if (static_cast<std::size_t>(message.name_size()) > contract_limits::kMaxJointCount)
+    return Fail("JointState holds more joints than the contract limit");
+  for (const auto & name : message.name()) {
+    if (name.empty() || name.size() > contract_limits::kMaxJointNameLength)
+      return Fail("joint name is outside the contract limit");
+    if (name.find('\0') != std::string::npos)
+      return Fail("joint name must not contain NUL");
+  }
+  const struct
+  {
+    const google::protobuf::RepeatedField<double> & values;
+    const char * name;
+  } arrays[] = {{message.position(), "position"}, {message.velocity(), "velocity"},
+      {message.effort(), "effort"}};
+  for (const auto & array : arrays) {
+    if (!array.values.empty() && array.values.size() != message.name_size())
+      return ConversionResult::Failure(
+          std::string(array.name) + " must be empty or match name size");
+    for (double value : array.values) {
+      if (!std::isfinite(value))
+        return ConversionResult::Failure(std::string(array.name) + " contains a non-finite value");
+    }
   }
   return ConversionResult::Success();
 }
@@ -414,6 +533,18 @@ ConversionResult ValidateImageLayout(const qrb::contract::sensor::v1::ImageLayou
 {
   ImageLayout layout;
   return ResolveImageLayout(image, externalPayloadSize, layout);
+}
+
+ConversionResult ValidateDetection2DArray(
+    const qrb::contract::vision::v1::Detection2DArray & detections)
+{
+  return ValidateDetectionArray(detections);
+}
+
+ConversionResult ValidateDetection3DArray(
+    const qrb::contract::vision::v1::Detection3DArray & detections)
+{
+  return ValidateDetectionArray(detections);
 }
 
 }  // namespace qrb::adapter

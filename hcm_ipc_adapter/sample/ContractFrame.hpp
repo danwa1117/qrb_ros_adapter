@@ -17,6 +17,8 @@
 #include "QC/Infras/Memory/BufferDescriptor.hpp"
 #include "QRB/Memory/Geometry/PoseArrayDescriptor.hpp"
 #include "QRB/Memory/Geometry/TFMessageDescriptor.hpp"
+#include "QRB/Memory/Sensor/JointStateBufferDescriptor.hpp"
+#include "QRB/Memory/Vision/ObjectDetectionDescriptor.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_converters.hpp"
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
 
@@ -86,6 +88,19 @@ public:
             tf->allocatorType = Memory::QC_MEMORY_ALLOCATOR_HEAP;
             tf->transformCount = 0;
         }
+        auto *joint = dynamic_cast<QRB::Memory::JointStateBufferDescriptor_t *>( created.get() );
+        if ( nullptr != joint )
+        {
+            // Constructed, aligned records for the most joints a received JointState may carry.
+            m_joints.resize( qrb::adapter::contract_limits::kMaxJointCount );
+            joint->pBuf = m_joints.data();
+            joint->size = QRB::Memory::JointStateBufferDescriptor_t::CalcBufferSize(
+                    (uint32_t) m_joints.size() );
+            joint->offset = 0;
+            joint->validSize = 0;
+            joint->allocatorType = Memory::QC_MEMORY_ALLOCATOR_HEAP;
+            joint->jointCount = 0;
+        }
         auto *poses = dynamic_cast<QRB::Memory::PoseArrayDescriptor_t *>( created.get() );
         if ( nullptr != poses )
         {
@@ -101,8 +116,11 @@ public:
         }
         // A DMA-BUF Contract keeps its data in a buffer of its own.
         auto *buffer = dynamic_cast<Memory::BufferDescriptor_t *>( created.get() );
-        if ( ( qrb::adapter::PayloadClass::kDmaBuf == binding->descriptor->payloadClass ) &&
-             ( nullptr != buffer ) )
+        const bool keepsData =
+                ( qrb::adapter::PayloadClass::kDmaBuf == binding->descriptor->payloadClass ) ||
+                ( nullptr !=
+                  dynamic_cast<QRB::Memory::ObjectDetectionDescriptor_t *>( created.get() ) );
+        if ( keepsData && ( nullptr != buffer ) )
         {
             if ( 0 == bufferBytes )
             {
@@ -157,6 +175,7 @@ private:
     void *m_data = nullptr;
     size_t m_size = 0;
     std::vector<QRB::Memory::TransformStamped_t> m_transforms;
+    std::vector<QRB::Memory::JointState_t> m_joints;
     std::vector<QRB::Memory::Pose_t> m_poses;
 };
 

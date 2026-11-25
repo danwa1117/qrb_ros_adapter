@@ -17,8 +17,11 @@
 #include "qrb/contract/geometry/v1/vector3_stamped.pb.h"
 #include "qrb/contract/nav/v1/odometry.pb.h"
 #include "qrb/contract/sensor/v1/image_layout.pb.h"
+#include "qrb/contract/sensor/v1/joint_state.pb.h"
 #include "qrb/contract/sensor/v1/point_cloud2.pb.h"
 #include "qrb/contract/tf2/v1/tf_message.pb.h"
+#include "qrb/contract/vision/v1/detection_2d_array.pb.h"
+#include "qrb/contract/vision/v1/detection_3d_array.pb.h"
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
 #include "qrb_ros_adapter/ipc_runtime/conversion_result.hpp"
 
@@ -48,6 +51,10 @@ ConversionResult ValidateTwistStamped(const qrb::contract::geometry::v1::TwistSt
  * `child_frame_id` (as a frame_id), a finite translation and a finite, non-zero rotation.
  */
 ConversionResult ValidateTFMessage(const qrb::contract::tf2::v1::TFMessage & message);
+
+/** @brief Checks the header, joint count/names and finite measurement arrays, each empty or
+ * name-sized. */
+ConversionResult ValidateJointState(const qrb::contract::sensor::v1::JointState & message);
 
 /**
  * @brief Checks the header and that the pose is present, with a finite position and orientation
@@ -117,6 +124,21 @@ ConversionResult ResolveImageLayout(const qrb::contract::sensor::v1::ImageLayout
 /** @brief Checks the header, shape, encoding and layout of an ImageLayout Contract. */
 ConversionResult ValidateImageLayout(const qrb::contract::sensor::v1::ImageLayout & image,
     std::uint64_t externalPayloadSize);
+
+/**
+ * @brief Checks a detection array a peer sent or this side built.
+ *
+ * Every number must be finite and every box size non-negative; `id` and `class_id` must fit
+ * contract_limits::kMaxDetectionStringLength and hold no NUL; a covariance is empty (unknown)
+ * or has 36 values. The detector may leave the quaternions of a box or a hypothesis pose
+ * unnormalized, or all zero, since many publishers never set them; they are passed on as
+ * they are. An empty array is valid: "nothing detected" is a result.
+ */
+ConversionResult ValidateDetection2DArray(
+    const qrb::contract::vision::v1::Detection2DArray & detections);
+
+ConversionResult ValidateDetection3DArray(
+    const qrb::contract::vision::v1::Detection3DArray & detections);
 
 }  // namespace qrb::adapter
 

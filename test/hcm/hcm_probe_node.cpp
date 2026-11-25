@@ -358,6 +358,103 @@ private:
   }
 };
 
+// --- sensor.v1.JointState (inline, over the descriptor's buffer) ---------------
+
+/** Three joints carry the six probe values in position then velocity; effort is zero. */
+template <>
+struct HcmProbeSample<adapter::JointStateHcmDescriptor>
+{
+  using Descriptor = adapter::JointStateHcmDescriptor;
+  using Joint = QRB::Memory::JointState_t;
+  static constexpr const char * kFrameId = "stream_probe";
+  static constexpr std::uint32_t kJoints = 3;
+  using Values = std::array<double, kMinProbeDoubles>;
+
+  static std::string CheckPayloadBytes(std::uint64_t) { return {}; }
+
+  static std::uint64_t SentBytes(const HcmSenderState &) { return sizeof(Values); }
+
+  static HcmStampResult Stamp(Descriptor & descriptor,
+      HcmSenderState & state,
+      std::uint64_t sequence)
+  {
+    const std::size_t bytes = Descriptor::CalcBufferSize(kJoints);
+    int fd = -1;
+    if (descriptor.offset > descriptor.size || descriptor.size - descriptor.offset < bytes ||
+        !UsableBuffer(descriptor, fd))
+      return HcmStampResult::kBadBuffer;
+    void * data = descriptor.GetDataPtr();
+    if (data == nullptr || reinterpret_cast<std::uintptr_t>(data) % alignof(Joint) != 0)
+      return HcmStampResult::kBadBuffer;
+
+    std::array<Joint, kJoints> joints{};
+    for (std::uint32_t i = 0; i < kJoints; ++i)
+      (void)joints[i].name.Assign(JointName(i).c_str());  // fits the fixed joint name
+    if (adapter::BeginDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+    const std::uint64_t now = MonotonicNowNs();
+    state.lastSendNs = now;
+    Values values{};
+    StampDoubles(values.data(), values.size(), state.streamTag, sequence, now);
+    for (std::uint32_t i = 0; i < kJoints; ++i) {
+      joints[i].position = values[i];
+      joints[i].velocity = values[kJoints + i];
+    }
+    std::memcpy(data, joints.data(), bytes);
+    if (adapter::EndDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+    (void)descriptor.frameId.Assign(kFrameId);  // fits FrameId_t
+    descriptor.timestampNs = now;
+    descriptor.jointCount = kJoints;
+    descriptor.validSize = bytes;
+    return HcmStampResult::kOk;
+  }
+
+  static FrameReading Check(const Descriptor & descriptor,
+      std::uint32_t streamTag,
+      std::uint64_t & payloadBytes)
+  {
+    payloadBytes = sizeof(Values);
+    FrameReading reading;
+    if (descriptor.jointCount != kJoints) {
+      reading.check = FrameCheck::kBadLayout;
+      return reading;
+    }
+    int fd = -1;
+    const Joint * data = descriptor.GetJointPtr(0);
+    if (data == nullptr || !UsableBuffer(descriptor, fd) ||
+        adapter::BeginDmaBufCpuRead(fd) != adapter::Status::kOk)
+      return reading;
+    std::array<Joint, kJoints> joints{};
+    std::memcpy(joints.data(), data, sizeof(joints));
+    if (adapter::EndDmaBufCpuRead(fd) != adapter::Status::kOk)
+      return reading;
+
+    Values values{};
+    bool layout = descriptor.frameId == kFrameId;
+    for (std::uint32_t i = 0; i < kJoints; ++i) {
+      values[i] = joints[i].position;
+      values[kJoints + i] = joints[i].velocity;
+      layout = layout && joints[i].name.Size() <= QRB::Memory::QRB_JOINT_NAME_MAX_LEN &&
+               joints[i].name == JointName(i).c_str() && joints[i].effort == 0.0;
+    }
+    reading = CheckDoubles(values.data(), values.size(), streamTag);
+    if (reading.check == FrameCheck::kOk && !layout)
+      reading.check = FrameCheck::kBadLayout;
+    return reading;
+  }
+
+private:
+  static std::string JointName(std::uint32_t index) { return "joint_" + std::to_string(index); }
+
+  static bool UsableBuffer(const Descriptor & descriptor, int & fd)
+  {
+    const adapter::HcmBufferAccess access = adapter::InspectHcmBuffer(descriptor, fd);
+    return access == adapter::HcmBufferAccess::kLocalDmaBuf ||
+           access == adapter::HcmBufferAccess::kHostMemory;
+  }
+};
+
 // --- geometry.v1.PoseStamped and PoseArray (inline) ---------------------------
 
 /**
@@ -843,6 +940,199 @@ private:
     return last.rows == 0 ? last.offset :
                             last.offset + last.stride * (last.rows - 1) + last.rowBytes;
   }
+};
+
+// --- vision.v1.Detection2DArray and Detection3DArray (inline) -------------------
+
+/** @brief The bounding box, the one thing the 2-D and 3-D detection probes differ in. */
+struct HcmBox2d
+{
+  using Box = QRB::Memory::BoundingBox2d_t;
+
+  static void Fill(Box & box, std::size_t detection)
+  {
+    box.center.position.x = detection_probe::BoxValue(detection, 0);
+    box.center.position.y = detection_probe::BoxValue(detection, 1);
+    box.center.theta = detection_probe::BoxValue(detection, 2);
+    box.sizeX = detection_probe::BoxValue(detection, 3);
+    box.sizeY = detection_probe::BoxValue(detection, 4);
+  }
+
+  static bool Matches(const Box & box, std::size_t detection)
+  {
+    return box.center.position.x == detection_probe::BoxValue(detection, 0) &&
+           box.center.position.y == detection_probe::BoxValue(detection, 1) &&
+           box.center.theta == detection_probe::BoxValue(detection, 2) &&
+           box.sizeX == detection_probe::BoxValue(detection, 3) &&
+           box.sizeY == detection_probe::BoxValue(detection, 4);
+  }
+};
+
+struct HcmBox3d
+{
+  using Box = QRB::Memory::BoundingBox3d_t;
+
+  static void Fill(Box & box, std::size_t detection)
+  {
+    box.center.position.x = detection_probe::BoxValue(detection, 0);
+    box.center.position.y = detection_probe::BoxValue(detection, 1);
+    box.center.position.z = detection_probe::BoxValue(detection, 2);
+    box.center.orientation.w = 1.0;
+    box.size.x = detection_probe::BoxValue(detection, 3);
+    box.size.y = detection_probe::BoxValue(detection, 4);
+    box.size.z = detection_probe::BoxValue(detection, 5);
+  }
+
+  static bool Matches(const Box & box, std::size_t detection)
+  {
+    return box.center.position.x == detection_probe::BoxValue(detection, 0) &&
+           box.center.position.y == detection_probe::BoxValue(detection, 1) &&
+           box.center.position.z == detection_probe::BoxValue(detection, 2) &&
+           box.center.orientation.x == 0.0 && box.center.orientation.y == 0.0 &&
+           box.center.orientation.z == 0.0 && box.center.orientation.w == 1.0 &&
+           box.size.x == detection_probe::BoxValue(detection, 3) &&
+           box.size.y == detection_probe::BoxValue(detection, 4) &&
+           box.size.z == detection_probe::BoxValue(detection, 5);
+  }
+};
+
+/**
+ * The frame of detection_probe as the records in the buffer of a detection descriptor. Unlike a
+ * point cloud, the buffer holds only the two records; `payload_bytes` just has to fit them.
+ */
+template <typename Descriptor, typename Record, typename BoxTraits>
+struct HcmDetectionProbe
+{
+  static constexpr std::size_t kRecordBytes = sizeof(Record) * detection_probe::kDetections;
+  static constexpr std::uint64_t kPayloadBytes =
+      detection_probe::kCovarianceDoubles * sizeof(double);
+
+  static std::string CheckPayloadBytes(std::uint64_t payloadBytes)
+  {
+    if (payloadBytes >= kRecordBytes)
+      return {};
+    return "'payload_bytes' of a detection Contract must hold " +
+           std::to_string(detection_probe::kDetections) + " detections: at least " +
+           std::to_string(kRecordBytes);
+  }
+
+  static std::uint64_t SentBytes(const HcmSenderState &) { return kPayloadBytes; }
+
+  static HcmStampResult Stamp(Descriptor & descriptor,
+      HcmSenderState & state,
+      std::uint64_t sequence)
+  {
+    int fd = -1;
+    if (!HasBuffer(descriptor, fd))
+      return HcmStampResult::kBadBuffer;
+
+    Record records[detection_probe::kDetections] = {};
+    for (std::size_t i = 0; i < detection_probe::kDetections; ++i) {
+      Record & record = records[i];
+      (void)std::snprintf(record.id, sizeof(record.id), "%s", detection_probe::Id(i));
+      BoxTraits::Fill(record.bbox, i);
+      record.resultCount = static_cast<std::uint32_t>(detection_probe::HypothesisCount(i));
+      for (std::size_t j = 0; j < record.resultCount; ++j) {
+        auto & result = record.results[j];
+        (void)std::snprintf(
+            result.classId, sizeof(result.classId), "%s", detection_probe::ClassId(i, j));
+        result.score = detection_probe::Score(i, j);
+        result.pose.pose.orientation.w = 1.0;
+      }
+    }
+    const std::uint64_t now = MonotonicNowNs();
+    state.lastSendNs = now;
+    auto & covariance = records[0].results[0].pose.covariance;
+    StampDoubles(covariance.data(), covariance.size(), state.streamTag, sequence, now);
+
+    if (adapter::BeginDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+    std::memcpy(descriptor.GetDataPtr(), records, kRecordBytes);
+    if (adapter::EndDmaBufCpuWrite(fd) != adapter::Status::kOk)
+      return HcmStampResult::kSyncFailed;
+
+    if (descriptor.frameId != detection_probe::kFrameId)
+      (void)descriptor.frameId.Assign(detection_probe::kFrameId);  // fits FrameId_t
+    descriptor.timestampNs = now;
+    descriptor.objCount = static_cast<std::uint32_t>(detection_probe::kDetections);
+    descriptor.validSize = kRecordBytes;
+    return HcmStampResult::kOk;
+  }
+
+  static FrameReading Check(const Descriptor & descriptor,
+      std::uint32_t streamTag,
+      std::uint64_t & payloadBytes)
+  {
+    payloadBytes = kPayloadBytes;
+    FrameReading reading;
+    int fd = -1;
+    if (descriptor.objCount != detection_probe::kDetections || !HasBuffer(descriptor, fd))
+      return reading;
+
+    Record records[detection_probe::kDetections];
+    if (adapter::BeginDmaBufCpuRead(fd) != adapter::Status::kOk)
+      return reading;
+    std::memcpy(records, descriptor.GetDataPtr(), kRecordBytes);
+    const bool ended = adapter::EndDmaBufCpuRead(fd) == adapter::Status::kOk;
+
+    const auto & covariance = records[0].results[0].pose.covariance;
+    reading = CheckDoubles(covariance.data(), covariance.size(), streamTag);
+    if (reading.check != FrameCheck::kOk)
+      return reading;
+    if (!ended) {
+      reading.check = FrameCheck::kBadPayload;
+      return reading;
+    }
+    if (!HasLayout(descriptor, records))
+      reading.check = FrameCheck::kBadLayout;
+    return reading;
+  }
+
+private:
+  /** @brief The two records fit the buffer, which this process can read and write. */
+  static bool HasBuffer(const Descriptor & descriptor, int & fd)
+  {
+    if (descriptor.pBuf == nullptr || descriptor.offset > descriptor.size ||
+        descriptor.size - descriptor.offset < kRecordBytes)
+      return false;
+    const adapter::HcmBufferAccess access = adapter::InspectHcmBuffer(descriptor, fd);
+    return access == adapter::HcmBufferAccess::kLocalDmaBuf ||
+           access == adapter::HcmBufferAccess::kHostMemory;
+  }
+
+  static bool HasLayout(const Descriptor & descriptor,
+      const Record (&records)[detection_probe::kDetections])
+  {
+    if (descriptor.frameId != detection_probe::kFrameId)
+      return false;
+    for (std::size_t i = 0; i < detection_probe::kDetections; ++i) {
+      const Record & record = records[i];
+      if (std::strncmp(record.id, detection_probe::Id(i), sizeof(record.id)) != 0 ||
+          !BoxTraits::Matches(record.bbox, i) ||
+          record.resultCount != detection_probe::HypothesisCount(i))
+        return false;
+      for (std::size_t j = 0; j < record.resultCount; ++j) {
+        const auto & result = record.results[j];
+        if (std::strncmp(result.classId, detection_probe::ClassId(i, j), sizeof(result.classId)) !=
+                0 ||
+            result.score != detection_probe::Score(i, j) || result.pose.pose.orientation.w != 1.0)
+          return false;
+      }
+    }
+    return true;
+  }
+};
+
+template <>
+struct HcmProbeSample<adapter::Detection2DHcmDescriptor>
+  : HcmDetectionProbe<adapter::Detection2DHcmDescriptor, QRB::Memory::Detection2dRaw_t, HcmBox2d>
+{
+};
+
+template <>
+struct HcmProbeSample<adapter::Detection3DHcmDescriptor>
+  : HcmDetectionProbe<adapter::Detection3DHcmDescriptor, QRB::Memory::Detection3dRaw_t, HcmBox3d>
+{
 };
 
 namespace
