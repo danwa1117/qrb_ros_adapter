@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/imu_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/joint_state_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
@@ -454,6 +455,55 @@ TEST(HcmConverters, TFMessageRoundTripsThroughTheBufferAndRejectsWhatItCannotHol
   std::memcpy(heap.descriptor.GetDataPtr(), &bad, sizeof(bad));
   EXPECT_FALSE(
       (ConvertHcmToContract<TFMessageHcmContract, TFMessageHcmDescriptor>(heap.descriptor, out)));
+}
+
+// UT-HCM-09: Imu keeps its header, orientation, angular_velocity and
+// linear_acceleration with all three covariances, and rejects what the
+// fixed-size descriptor cannot hold.
+TEST(HcmConverters, ImuRoundTripsEveryFieldAndRejectsInvalidValues)
+{
+  const ImuHcmContract source = MakeImu();
+  ImuHcmDescriptor descriptor;
+  ASSERT_TRUE(
+      (ConvertContractToHcm<ImuHcmContract, ImuHcmDescriptor>(source, DmaBufView{}, descriptor)));
+  EXPECT_EQ(descriptor.timestampNs, 5500000000u);
+  EXPECT_TRUE(descriptor.frameId == "imu_link");
+  EXPECT_DOUBLE_EQ(descriptor.orientation.w, 1.0);
+  EXPECT_DOUBLE_EQ(descriptor.angular_velocity.x, 0.1);
+  EXPECT_DOUBLE_EQ(descriptor.angular_velocity.y, -0.2);
+  EXPECT_DOUBLE_EQ(descriptor.linear_acceleration.z, -9.8);
+  EXPECT_DOUBLE_EQ(descriptor.orientation_covariance[8], 0.08);
+  EXPECT_DOUBLE_EQ(descriptor.angular_velocity_covariance[8], 0.16);
+  EXPECT_DOUBLE_EQ(descriptor.linear_acceleration_covariance[8], 0.24);
+
+  ImuHcmContract back;
+  back.mutable_header()->set_frame_id("stale");
+  ASSERT_TRUE((ConvertHcmToContract<ImuHcmContract, ImuHcmDescriptor>(descriptor, back)));
+  EXPECT_EQ(back.SerializeAsString(), source.SerializeAsString());
+
+  // A rejected message leaves the descriptor untouched.
+  ImuHcmDescriptor untouched;
+  ASSERT_EQ(untouched.frameId.Assign("untouched"), QC::QC_STATUS_OK);
+  ImuHcmContract invalid = MakeImu();
+  invalid.mutable_orientation()->set_w(0.0);
+  invalid.mutable_orientation()->set_x(0.0);
+  const ConversionResult in =
+      ConvertContractToHcm<ImuHcmContract, ImuHcmDescriptor>(invalid, DmaBufView{}, untouched);
+  EXPECT_FALSE(in);
+  EXPECT_FALSE(in.Diagnostic().empty());
+  EXPECT_TRUE(untouched.frameId == "untouched");
+
+  // FrameId_t is fixed-size: a longer frame_id is rejected, never truncated.
+  ImuHcmContract longFrame = MakeImu();
+  longFrame.mutable_header()->set_frame_id(std::string(QRB::Memory::QRB_FRAME_ID_MAX_LEN + 1, 'f'));
+  EXPECT_FALSE(
+      (ConvertContractToHcm<ImuHcmContract, ImuHcmDescriptor>(longFrame, DmaBufView{}, untouched)));
+  EXPECT_TRUE(untouched.frameId == "untouched");
+
+  // A non-finite value produced on the HCM side must not reach ROS.
+  descriptor.angular_velocity.x = std::numeric_limits<double>::infinity();
+  ImuHcmContract out;
+  EXPECT_FALSE((ConvertHcmToContract<ImuHcmContract, ImuHcmDescriptor>(descriptor, out)));
 }
 
 namespace
