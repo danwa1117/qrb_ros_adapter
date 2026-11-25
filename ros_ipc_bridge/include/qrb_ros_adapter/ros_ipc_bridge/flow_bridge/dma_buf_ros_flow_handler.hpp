@@ -28,7 +28,7 @@ namespace qrb::adapter
 {
 
 /**
- * @brief Complete ROS endpoint and ownership implementation for one DMA-BUF Contract.
+ * @brief Complete ROS endpoint and ownership implementation for one DmaBuf Contract.
  *
  * The message pair supplies one RosConversion policy. Its two methods bind the
  * message's DMA-BUF through typed payload contexts while this handler owns all
@@ -38,7 +38,7 @@ template <typename RosMessageT, typename ContractT>
 class DmaBufRosFlowHandler final : public TypedRosFlowHandler<ContractT>
 {
   static_assert(rclcpp::TypeAdapter<RosMessageT>::is_specialized::value,
-      "a DMA-BUF Flow must use a qrb_ros_transport custom type with a registered "
+      "a DmaBuf Flow must use a qrb_ros_transport custom type with a registered "
       "rclcpp::TypeAdapter");
 
 public:
@@ -119,7 +119,7 @@ protected:
     if (publisher_ == nullptr)
       return Status::kBadState;
     if (!payload.hasPayload || !payload.fd.IsValid()) {
-      diagnostic += "DMA-BUF contract received no payload fd; ";
+      diagnostic += "DmaBuf contract received no payload fd; ";
       return Status::kProtocolError;
     }
 
@@ -224,7 +224,7 @@ private:
     const bool sourceUnmapped = source->unmap();
     const bool destinationUnmapped = !destinationMapped || destination->unmap();
     if (!copied || !sourceSyncEnded || !sourceUnmapped || !destinationUnmapped) {
-      diagnostic += "failed to copy or synchronize the ROS-owned DMA-BUF; ";
+      diagnostic += "failed to copy or synchronize the ROS-side DMA-BUF; ";
       destination.reset();
       return Status::kResourceError;
     }

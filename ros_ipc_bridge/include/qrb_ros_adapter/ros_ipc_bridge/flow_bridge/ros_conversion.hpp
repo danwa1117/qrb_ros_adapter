@@ -61,7 +61,7 @@ private:
 };
 
 /**
- * @brief One row range to copy from the received payload into the ROS-owned destination.
+ * @brief One row range to copy from the received payload into the destination in host storage.
  *
  * `sourceOffset` is relative to the IPC payload offset, `destinationOffset` to the
  * start of the destination allocation. Only `rowBytes` of each row carry valid
@@ -216,7 +216,7 @@ private:
  * @brief Message-specific ROS/Contract conversion policy.
  *
  * Each registered message pair provides one full specialization containing
- * exactly two static methods, one for each conversion direction. DMA-BUF
+ * exactly two static methods, one for each conversion direction. DmaBuf
  * policies additionally receive the corresponding payload context.
  */
 template <typename RosMessageT, typename ContractT>

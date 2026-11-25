@@ -25,7 +25,7 @@ using ImageRosContract = ::qrb::contract::sensor::v1::ImageLayout;
  * qrb_ros_transport aligned layout (CanonicalImageLayout()). ROS to Contract
  * therefore leaves `planes` empty and forwards the producer's buffer. Contract to
  * ROS reads the source with the native planes the Contract describes and repacks
- * the valid rows into a ROS-owned buffer in the aligned layout.
+ * the valid rows into host storage in the aligned layout.
  */
 template <>
 struct RosConversion<ImageRosMessage, ImageRosContract>
