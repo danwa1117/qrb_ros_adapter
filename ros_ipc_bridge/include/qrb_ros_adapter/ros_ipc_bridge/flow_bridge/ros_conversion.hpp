@@ -4,9 +4,13 @@
 #ifndef QRB_ROS_ADAPTER_ROS_IPC_BRIDGE_FLOW_BRIDGE_ROS_CONVERSION_HPP
 #define QRB_ROS_ADAPTER_ROS_IPC_BRIDGE_FLOW_BRIDGE_ROS_CONVERSION_HPP
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <lib_mem_dmabuf/dmabuf.hpp>
+#include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "qrb_ros_adapter/ipc_runtime/conversion_result.hpp"
@@ -56,6 +60,26 @@ private:
   std::uint64_t offset_{0};
 };
 
+/**
+ * @brief One row range to copy from the received payload into the destination in host storage.
+ *
+ * `sourceOffset` is relative to the IPC payload offset, `destinationOffset` to the
+ * start of the destination allocation. Only `rowBytes` of each row carry valid
+ * data; the two strides may differ, so the copy is row by row.
+ */
+struct PayloadCopyRegion
+{
+  std::uint64_t sourceOffset{0};
+  std::uint64_t sourceStride{0};
+  std::uint64_t destinationOffset{0};
+  std::uint64_t destinationStride{0};
+  std::uint64_t rowBytes{0};
+  std::uint64_t rows{0};
+};
+
+/** @brief At most two regions: the supported Image encodings have one or two planes. */
+inline constexpr std::size_t kMaxPayloadCopyRegions = 2;
+
 /** @brief Destination selected by a Contract-to-ROS DMA conversion. */
 class ContractToRosPayload final
 {
@@ -84,9 +108,64 @@ public:
     return ConversionResult::Success();
   }
 
+  /**
+   * @brief Bind a destination whose rows are repacked from `regions`.
+   *
+   * Unlike Bind(), `size` is the destination allocation and is not bounded by the
+   * received range: a compact native source legitimately repacks into a larger,
+   * padded ROS layout. Each region's source span must fit the received range, and
+   * the destination regions must fit `size` without overlapping. The plan is
+   * copied, so the caller may keep `regions` on its own stack.
+   */
+  ConversionResult BindRegions(std::shared_ptr<lib_mem_dmabuf::DmaBuffer> & destination,
+      std::uint64_t size,
+      const PayloadCopyRegion * regions,
+      std::size_t regionCount)
+  {
+    if (destination_ != nullptr) {
+      return ConversionResult::Failure("DMA-BUF destination payload is already bound");
+    }
+    if (size == 0) {
+      return ConversionResult::Failure("DMA-BUF payload is empty");
+    }
+    if (regions == nullptr || regionCount == 0 || regionCount > kMaxPayloadCopyRegions) {
+      return ConversionResult::Failure("payload copy plan has an unsupported region count");
+    }
+    for (std::size_t index = 0; index < regionCount; ++index) {
+      const PayloadCopyRegion & region = regions[index];
+      if (region.rows == 0 || region.rowBytes == 0) {
+        return ConversionResult::Failure("payload copy region is empty");
+      }
+      if (region.rowBytes > region.sourceStride || region.rowBytes > region.destinationStride) {
+        return ConversionResult::Failure("payload copy region row exceeds a stride");
+      }
+      ConversionResult sourceSpan = CheckRegionSpan(region.sourceOffset, region.sourceStride,
+          region.rowBytes, region.rows, availableCapacity_, "source");
+      if (!sourceSpan)
+        return sourceSpan;
+      ConversionResult destinationSpan = CheckRegionSpan(region.destinationOffset,
+          region.destinationStride, region.rowBytes, region.rows, size, "destination");
+      if (!destinationSpan)
+        return destinationSpan;
+      for (std::size_t earlier = 0; earlier < index; ++earlier) {
+        if (RegionsOverlap(regions[earlier], region)) {
+          return ConversionResult::Failure("payload copy regions overlap in the destination");
+        }
+      }
+      regions_[index] = region;
+    }
+    destination_ = &destination;
+    size_ = size;
+    regionCount_ = regionCount;
+    return ConversionResult::Success();
+  }
+
   bool IsBound() const noexcept { return destination_ != nullptr; }
   std::uint64_t Size() const noexcept { return size_; }
   std::uint64_t AvailableCapacity() const noexcept { return availableCapacity_; }
+  /** @brief Regions bound by BindRegions(); zero for a flat Bind(). */
+  std::size_t RegionCount() const noexcept { return regionCount_; }
+  const PayloadCopyRegion & RegionAt(std::size_t index) const noexcept { return regions_[index]; }
 
   bool Assign(std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buffer)
   {
@@ -97,9 +176,40 @@ public:
   }
 
 private:
+  /** @brief rows * stride, less the stride padding the last row does not need. */
+  static ConversionResult CheckRegionSpan(std::uint64_t offset,
+      std::uint64_t stride,
+      std::uint64_t rowBytes,
+      std::uint64_t rows,
+      std::uint64_t limit,
+      const char * side)
+  {
+    if (stride > std::numeric_limits<std::uint64_t>::max() / rows) {
+      return ConversionResult::Failure(
+          std::string(side) + " payload copy region row span overflows");
+    }
+    const std::uint64_t span = stride * (rows - 1) + rowBytes;
+    if (offset > limit || span > limit - offset) {
+      return ConversionResult::Failure(
+          std::string(side) + " payload copy region exceeds its DMA-BUF range");
+    }
+    return ConversionResult::Success();
+  }
+
+  static bool RegionsOverlap(const PayloadCopyRegion & a, const PayloadCopyRegion & b)
+  {
+    const std::uint64_t endA =
+        a.destinationOffset + a.destinationStride * (a.rows - 1) + a.rowBytes;
+    const std::uint64_t endB =
+        b.destinationOffset + b.destinationStride * (b.rows - 1) + b.rowBytes;
+    return a.destinationOffset < endB && b.destinationOffset < endA;
+  }
+
   std::shared_ptr<lib_mem_dmabuf::DmaBuffer> * destination_{nullptr};
   std::uint64_t availableCapacity_{0};
   std::uint64_t size_{0};
+  std::array<PayloadCopyRegion, kMaxPayloadCopyRegions> regions_{};
+  std::size_t regionCount_{0};
 };
 
 /**

@@ -382,6 +382,23 @@ TEST(ContractValidation, RejectsInvalidJointStateAndPreservesMissingMeasurements
 namespace
 {
 
+/** @brief A 4x2 rgb8 image in one explicit, padded native plane. */
+sensor_proto::ImageLayout MakeImage()
+{
+  sensor_proto::ImageLayout image;
+  image.mutable_header()->mutable_stamp()->set_sec(1);
+  image.set_width(4);
+  image.set_height(2);
+  image.set_encoding("rgb8");
+  image.set_step(12);
+  image.set_batch_size(1);
+  auto * plane = image.add_planes();
+  plane->set_stride(16);
+  plane->set_actual_height(3);
+  plane->set_buffer_size(64);
+  return image;
+}
+
 geometry_proto::PoseStamped MakePoseStamped()
 {
   geometry_proto::PoseStamped pose;
@@ -393,6 +410,63 @@ geometry_proto::PoseStamped MakePoseStamped()
 }
 
 }  // namespace
+
+// UT-IPC-06: Without planes an ImageLayout uses the qrb_ros_transport aligned
+// layout (128-pixel rows, 32-row planes, 256-pixel rgb allocations, 4096-byte
+// total); explicit planes describe a native layout. Both must fit the payload.
+TEST(ContractValidation, ResolvesImageLayoutsAndRejectsInvalidOnes)
+{
+  ImageLayout layout;
+  ASSERT_TRUE(CanonicalImageLayout(1920, 1080, "rgb8", layout));
+  EXPECT_EQ(layout.planes[0].stride, 5760u);
+  EXPECT_EQ(layout.planes[0].actualHeight, 1088u);
+  EXPECT_EQ(layout.storageSize, 2048u * 1088 * 3);
+  ASSERT_TRUE(CanonicalImageLayout(1928, 1208, "nv12", layout));
+  EXPECT_EQ(layout.planes[0].stride, 2048u);
+  EXPECT_EQ(layout.planes[1].offset, 2048u * 1216);
+  EXPECT_EQ(layout.planes[1].rows, 604u);
+  EXPECT_EQ(layout.storageSize, 2048u * 1216 * 3 / 2);
+
+  sensor_proto::ImageLayout image = MakeImage();
+  image.clear_planes();
+  image.set_batch_size(0);
+  ASSERT_TRUE(CanonicalImageLayout(4, 2, "rgb8", layout));
+  EXPECT_TRUE(ValidateImageLayout(image, layout.storageSize));
+  EXPECT_FALSE(ValidateImageLayout(image, layout.storageSize - 1));
+  ASSERT_TRUE(ValidateImageLayout(MakeImage(), 64));
+  EXPECT_FALSE(ValidateImageLayout(MakeImage(), 63));
+
+  using Image = sensor_proto::ImageLayout;
+  const struct
+  {
+    const char * name;
+    void (*mutate)(Image &);
+  } cases[] = {
+      {"UnknownEncoding", [](Image & i) { i.set_encoding("rgba8"); }},
+      {"PhysicalStep", [](Image & i) { i.set_step(16); }},
+      {"EmbeddedData", [](Image & i) { i.set_data("pixel"); }},
+      {"AbsoluteFrameId", [](Image & i) { i.mutable_header()->set_frame_id("/camera"); }},
+      {"NanosecOverflow",
+          [](Image & i) { i.mutable_header()->mutable_stamp()->set_nanosec(1000000000); }},
+      {"BigEndian", [](Image & i) { i.set_is_bigendian(true); }},
+      {"MultiFrame", [](Image & i) { i.set_batch_size(2); }},
+      {"ExtraPlane", [](Image & i) { i.add_planes(); }},
+      {"ShortStride", [](Image & i) { i.mutable_planes(0)->set_stride(11); }},
+      {"ShortPlane", [](Image & i) { i.mutable_planes(0)->set_buffer_size(47); }},
+      {"OddNv12",
+          [](Image & i) {
+            i.set_encoding("nv12");
+            i.set_width(3);
+            i.set_step(3);
+          }},
+  };
+  for (const auto & c : cases) {
+    SCOPED_TRACE(c.name);
+    Image value = MakeImage();
+    c.mutate(value);
+    EXPECT_FALSE(ValidateImageLayout(value, std::numeric_limits<std::uint64_t>::max()));
+  }
+}
 
 // UT-IPC-06: PoseStamped needs a valid header and a present pose with a finite position and
 // orientation and a quaternion that is not zero; one that is not of unit length is passed on as it

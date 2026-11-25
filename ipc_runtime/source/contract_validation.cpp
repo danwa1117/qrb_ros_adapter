@@ -398,6 +398,143 @@ ConversionResult ValidatePointCloud2(const qrb::contract::sensor::v1::PointCloud
   return ConversionResult::Success();
 }
 
+namespace
+{
+
+bool CheckedMultiply(std::uint64_t a, std::uint64_t b, std::uint64_t & result)
+{
+  if (b != 0 && a > std::numeric_limits<std::uint64_t>::max() / b)
+    return false;
+  result = a * b;
+  return true;
+}
+
+bool CheckedAdd(std::uint64_t a, std::uint64_t b, std::uint64_t & result)
+{
+  if (a > std::numeric_limits<std::uint64_t>::max() - b)
+    return false;
+  result = a + b;
+  return true;
+}
+
+bool AlignUp(std::uint64_t value, std::uint64_t alignment, std::uint64_t & result)
+{
+  const std::uint64_t remainder = value % alignment;
+  return CheckedAdd(value, remainder == 0 ? 0 : alignment - remainder, result);
+}
+
+}  // namespace
+
+ConversionResult CanonicalImageLayout(std::uint32_t width,
+    std::uint32_t height,
+    const std::string & encoding,
+    ImageLayout & layout)
+{
+  if (width == 0 || height == 0)
+    return Fail("image dimensions must be non-zero");
+  const bool nv12 = encoding == "nv12";
+  if (!nv12 && encoding != "rgb8" && encoding != "bgr8")
+    return Fail("image encoding is unsupported");
+  if (nv12 && (width % 2 != 0 || height % 2 != 0))
+    return Fail("nv12 image dimensions must be even");
+
+  ImageLayout value;
+  std::uint64_t pitchWidth = 0;
+  std::uint64_t allocationWidth = 0;
+  std::uint64_t actualHeight = 0;
+  std::uint64_t pitch = 0;
+  std::uint64_t planeStorage = 0;
+  std::uint64_t allocation = 0;
+  const std::uint64_t channels = nv12 ? 1 : 3;
+  if (!AlignUp(width, 128, pitchWidth) || !AlignUp(width, nv12 ? 128 : 256, allocationWidth) ||
+      !AlignUp(height, 32, actualHeight) || !CheckedMultiply(width, channels, value.step) ||
+      !CheckedMultiply(pitchWidth, channels, pitch) ||
+      !CheckedMultiply(pitch, actualHeight, planeStorage) ||
+      !CheckedMultiply(allocationWidth, actualHeight, allocation) ||
+      !CheckedMultiply(allocation, channels, allocation) ||
+      (nv12 && !CheckedAdd(allocation, allocation / 2, allocation)) ||
+      !AlignUp(allocation, 4096, allocation) ||
+      !CheckedMultiply(value.step, height, value.pixelSize) ||
+      (nv12 && !CheckedAdd(value.pixelSize, value.pixelSize / 2, value.pixelSize))) {
+    return Fail("image layout arithmetic overflows");
+  }
+  // qrb_ros_transport computes the aligned sizes with signed int.
+  if (allocation > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      pitch > std::numeric_limits<std::uint32_t>::max() ||
+      actualHeight > std::numeric_limits<std::uint32_t>::max() ||
+      value.step > std::numeric_limits<std::uint32_t>::max()) {
+    return Fail("image layout is not representable by the ROS transport");
+  }
+
+  value.planeCount = nv12 ? 2 : 1;
+  value.storageSize = allocation;
+  value.planes[0] = {0, pitch, actualHeight, nv12 ? planeStorage : allocation, value.step, height};
+  if (nv12) {
+    value.planes[1] = {
+        planeStorage, pitch, actualHeight / 2, allocation - planeStorage, value.step, height / 2};
+  }
+  layout = value;
+  return ConversionResult::Success();
+}
+
+ConversionResult ResolveImageLayout(const qrb::contract::sensor::v1::ImageLayout & image,
+    std::uint64_t externalPayloadSize,
+    ImageLayout & layout)
+{
+  ConversionResult header = ValidateHeader(image.header());
+  if (!header)
+    return header;
+  if (image.is_bigendian())
+    return Fail("image is_bigendian must be false");
+  if (!image.data().empty())
+    return Fail("image data must travel in the external DMA-BUF");
+
+  ImageLayout value;
+  ConversionResult canonical =
+      CanonicalImageLayout(image.width(), image.height(), image.encoding(), value);
+  if (!canonical)
+    return canonical;
+  if (image.step() != value.step)
+    return Fail("image step must equal the logical row byte count");
+  if (image.planes_size() == 0) {
+    if (image.batch_size() > 1)
+      return Fail("image batch_size must be zero or one");
+  } else {
+    if (image.batch_size() != 1)
+      return Fail("explicit image planes require batch_size one");
+    if (static_cast<std::size_t>(image.planes_size()) != value.planeCount)
+      return Fail("image plane count does not match the encoding");
+    value.storageSize = 0;
+    for (std::size_t i = 0; i < value.planeCount; ++i) {
+      const auto & plane = image.planes(static_cast<int>(i));
+      ImagePlaneLayout & resolved = value.planes[i];
+      std::uint64_t minimumSize = 0;
+      if (plane.stride() < resolved.rowBytes || plane.actual_height() < resolved.rows ||
+          !CheckedMultiply(plane.stride(), plane.actual_height(), minimumSize) ||
+          plane.buffer_size() < minimumSize) {
+        return Fail("image plane storage cannot cover its rows");
+      }
+      resolved.offset = value.storageSize;
+      resolved.stride = plane.stride();
+      resolved.actualHeight = plane.actual_height();
+      resolved.bufferSize = plane.buffer_size();
+      if (!CheckedAdd(value.storageSize, resolved.bufferSize, value.storageSize))
+        return Fail("image plane sizes overflow");
+    }
+  }
+  if (value.storageSize > externalPayloadSize)
+    return Fail("external payload is smaller than the image layout");
+  layout = value;
+  return ConversionResult::Success();
+}
+
+ConversionResult ValidateImageLayout(const qrb::contract::sensor::v1::ImageLayout & image,
+    std::uint64_t externalPayloadSize)
+{
+  ImageLayout layout;
+  return ResolveImageLayout(image, externalPayloadSize, layout);
+}
+
 ConversionResult ValidateDetection2DArray(
     const qrb::contract::vision::v1::Detection2DArray & detections)
 {

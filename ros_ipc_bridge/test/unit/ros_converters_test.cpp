@@ -16,6 +16,8 @@
 #include <sensor_msgs/msg/point_field.hpp>
 
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
+#include "qrb_ros_adapter/ipc_runtime/contract_time.hpp"
+#include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/image_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/joint_state_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/odometry_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/point_cloud_ros_converter.hpp"
@@ -284,6 +286,185 @@ TEST(TFMessageRosConverter, MapsEveryTransformBothWaysAndRejectsInvalidValues)
   ASSERT_TRUE(TFMessageRosConversion::RosToContract(ros, badContract));
   badContract.mutable_transforms(0)->mutable_header()->set_frame_id("/map");
   EXPECT_FALSE(TFMessageRosConversion::ContractToRos(badContract, back));
+}
+
+namespace
+{
+
+// four sizes below are routinely confused; the converter must pick the right one.
+constexpr std::uint32_t kImageWidth = 1920;
+constexpr std::uint32_t kImageHeight = 1080;
+constexpr std::uint64_t kImageStep = 5760;           // logical: width * 3
+constexpr std::uint64_t kImagePixels = 6220800;      // step * height
+constexpr std::uint64_t kImagePitchRows = 6266880;   // pitch * aligned height
+constexpr std::uint64_t kImageAllocation = 6684672;  // full aligned allocation
+
+/** @brief The custom transport type leaves its scalars uninitialized. */
+ImageRosMessage MakeRosImage(std::uint32_t width = kImageWidth,
+    std::uint32_t height = kImageHeight,
+    const char * encoding = "rgb8",
+    std::uint64_t bufferSize = kImageAllocation)
+{
+  auto image = ImageRosMessage();
+  image.header.stamp.sec = 7;
+  image.header.stamp.nanosec = 123456789;
+  image.header.frame_id = "camera";
+  image.width = static_cast<int>(width);
+  image.height = static_cast<int>(height);
+  image.encoding = encoding;
+  image.dmabuf = MakeMemfdBuffer(bufferSize);
+  return image;
+}
+
+/** @brief One explicit plane, as an HCM peer describes its native layout. */
+void AddPlane(ImageRosContract & image,
+    std::uint32_t stride,
+    std::uint32_t actualHeight,
+    std::uint32_t bufferSize)
+{
+  auto * plane = image.add_planes();
+  plane->set_stride(stride);
+  plane->set_actual_height(actualHeight);
+  plane->set_buffer_size(bufferSize);
+}
+}  // namespace
+
+// UT-ROS-05: Image metadata maps to the fields the custom transport type
+// actually has, ROS -> Contract binds the producer's buffer over the canonical
+// aligned layout and leaves planes empty per the proto, and Contract -> ROS
+// turns an arbitrary native plane layout into a valid-pixel copy plan over the
+// independently sized canonical destination.
+TEST(ImageRosConverter, MapsMetadataBindsTheDmaBufAndPlansTheCanonicalRepack)
+{
+  // ROS -> Contract: the bound range is the full allocation, not the logical
+  // pixels and not the buffer capacity.
+  const ImageRosMessage source =
+      MakeRosImage(kImageWidth, kImageHeight, "rgb8", kImageAllocation + 4096);
+  ASSERT_NE(source.dmabuf, nullptr);
+
+  ImageRosContract contract;
+  RosToContractPayload outbound;
+  ASSERT_TRUE(ImageRosConversion::RosToContract(source, contract, outbound));
+  EXPECT_EQ(contract.header().stamp().sec(), 7);
+  EXPECT_EQ(contract.header().stamp().nanosec(), 123456789u);
+  EXPECT_EQ(contract.header().frame_id(), "camera");
+  EXPECT_FALSE(contract.is_bigendian());
+  EXPECT_EQ(contract.width(), kImageWidth);
+  EXPECT_EQ(contract.height(), kImageHeight);
+  EXPECT_EQ(contract.encoding(), "rgb8");
+  EXPECT_EQ(contract.step(), kImageStep);
+  EXPECT_TRUE(contract.data().empty());
+  EXPECT_EQ(contract.planes_size(), 0);  // the proto reserves planes for HCM -> ROS
+  EXPECT_EQ(contract.batch_size(), 0u);
+  EXPECT_EQ(outbound.Buffer(), source.dmabuf);
+  EXPECT_EQ(outbound.Size(), kImageAllocation);
+  EXPECT_NE(outbound.Size(), kImagePixels);
+  EXPECT_NE(outbound.Size(), kImagePitchRows);
+  EXPECT_EQ(outbound.Offset(), 0u);
+
+  // Contract -> ROS, explicit compact native plane: the destination
+  // allocation stays canonical and is deliberately *not* bounded by the
+  // smaller source range.
+  {
+    constexpr std::uint32_t kTightBuffer = kImageStep * kImageHeight;
+    ImageRosContract compact = contract;
+    compact.set_batch_size(1);
+    AddPlane(compact, kImageStep, kImageHeight, kTightBuffer);
+
+    auto back = ImageRosMessage();
+    ContractToRosPayload inbound(kTightBuffer);
+    ASSERT_TRUE(ImageRosConversion::ContractToRos(compact, back, inbound));
+    EXPECT_EQ(inbound.Size(), kImageAllocation);
+    EXPECT_GT(inbound.Size(), inbound.AvailableCapacity());  // compact -> padded
+    ASSERT_EQ(inbound.RegionCount(), 1u);
+    EXPECT_EQ(inbound.RegionAt(0).sourceStride, kImageStep);
+    EXPECT_EQ(inbound.RegionAt(0).rows, kImageHeight);
+  }
+
+  // NV12 adds a UV plane whose destination starts at the canonical Y storage
+  // and whose last plane absorbs the trailing allocation padding.
+  {
+    constexpr std::uint32_t kNv12Width = 64;
+    constexpr std::uint32_t kNv12Height = 32;
+    constexpr std::uint64_t kNv12YStorage = 4096;    // pitch 128 * aligned 32
+    constexpr std::uint64_t kNv12Allocation = 8192;  // align4096( Y * 3/2 )
+    ImageRosContract nv12;
+    RosToContractPayload bound;
+    ASSERT_TRUE(ImageRosConversion::RosToContract(
+        MakeRosImage(kNv12Width, kNv12Height, "nv12", kNv12Allocation), nv12, bound));
+    EXPECT_EQ(nv12.step(), kNv12Width);  // NV12 logical step is width, not width * 3
+    EXPECT_EQ(bound.Size(), kNv12Allocation);
+
+    auto back = ImageRosMessage();
+    ContractToRosPayload inbound(kNv12Allocation);
+    ASSERT_TRUE(ImageRosConversion::ContractToRos(nv12, back, inbound));
+    EXPECT_EQ(inbound.Size(), kNv12Allocation);
+    ASSERT_EQ(inbound.RegionCount(), 2u);
+    EXPECT_EQ(inbound.RegionAt(0).destinationOffset, 0u);
+    EXPECT_EQ(inbound.RegionAt(0).rows, kNv12Height);
+    EXPECT_EQ(inbound.RegionAt(1).destinationOffset, kNv12YStorage);
+    EXPECT_EQ(inbound.RegionAt(1).rows, kNv12Height / 2);
+    EXPECT_EQ(inbound.RegionAt(1).rowBytes, kNv12Width);
+
+    // Odd NV12 dimensions would make the UV row count disagree with the
+    // external TypeAdapter's data cropping.
+    ImageRosContract odd;
+    RosToContractPayload rejected;
+    EXPECT_FALSE(ImageRosConversion::RosToContract(
+        MakeRosImage(kNv12Width + 1, kNv12Height, "nv12"), odd, rejected));
+    EXPECT_FALSE(rejected.IsBound());
+  }
+
+  // A missing source time must not silently become a zero ROS stamp.
+  {
+    ImageRosContract missingTime = contract;
+    missingTime.mutable_header()->clear_stamp();
+    auto back = MakeRosImage();
+    const auto previous = back.header;
+    ContractToRosPayload inbound(kImageAllocation);
+    EXPECT_FALSE(ImageRosConversion::ContractToRos(missingTime, back, inbound));
+    EXPECT_FALSE(inbound.IsBound());
+    EXPECT_EQ(back.header, previous);
+  }
+
+  // The region plan itself: bound once, over non-empty in-range rows whose
+  // destination regions do not overlap.
+  {
+    std::shared_ptr<lib_mem_dmabuf::DmaBuffer> unused;
+    const PayloadCopyRegion ok{0, 16, 0, 32, 16, 4};
+    {
+      ContractToRosPayload planned(64);
+      EXPECT_FALSE(planned.BindRegions(unused, 128, nullptr, 1));
+      EXPECT_FALSE(planned.BindRegions(unused, 0, &ok, 1));
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &ok, 0));
+      const PayloadCopyRegion empty{0, 16, 0, 32, 16, 0};
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &empty, 1));
+      const PayloadCopyRegion wideRow{0, 16, 0, 32, 17, 4};
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &wideRow, 1));
+      const PayloadCopyRegion pastSource{1, 16, 0, 32, 16, 4};
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &pastSource, 1));
+      // In range at the source, past the end of the destination allocation.
+      const PayloadCopyRegion pastDestination{0, 16, 32, 32, 16, 4};
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &pastDestination, 1));
+      EXPECT_FALSE(planned.IsBound());
+      EXPECT_EQ(planned.RegionCount(), 0u);
+    }
+    {
+      // Overlapping destinations would let one plane overwrite another.
+      const PayloadCopyRegion overlapping[2] = {ok, {0, 16, 64, 32, 16, 2}};
+      ContractToRosPayload planned(64);
+      EXPECT_FALSE(planned.BindRegions(unused, 128, overlapping, 2));
+    }
+    {
+      ContractToRosPayload planned(64);
+      ASSERT_TRUE(planned.BindRegions(unused, 128, &ok, 1));
+      EXPECT_TRUE(planned.IsBound());
+      EXPECT_EQ(planned.Size(), 128u);
+      EXPECT_EQ(planned.RegionAt(0).rows, 4u);
+      EXPECT_FALSE(planned.BindRegions(unused, 128, &ok, 1));  // already bound
+      EXPECT_FALSE(planned.Bind(unused, 64));                  // already bound
+    }
+  }
 }
 
 // UT-ROS-05: sensor_msgs/JointState maps 1:1 to the Contract; an empty

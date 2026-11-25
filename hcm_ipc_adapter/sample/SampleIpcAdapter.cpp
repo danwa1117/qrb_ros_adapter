@@ -36,9 +36,9 @@
  *   output_topic  : (optional) direction 1: the topic to publish the fetched frames on
  *   pool_size     : (optional) frames to fetch into with output_topic, 1..32, default 4
  *   fps           : (optional) frames per second, 0 for no pause, default 30
- *   payload_bytes : (optional) bytes of points sent to ROS, for PointCloud2, default 1048576;
- *                   for Detection2DArray and Detection3DArray, the buffer that holds the two
- *                   detections the sample sends
+ *   payload_bytes : (optional) bytes of points sent to ROS, for PointCloud2, or of the rgb8
+ *                   rows of an ImageLayout, default 1048576; for Detection2DArray and
+ *                   Detection3DArray, the buffer that holds the two detections the sample sends
  *   buffer_bytes  : (optional) direction 1, for a DmaBuf Contract and for the detections: size of
  *                   the DMA buffer the sample receives into, default 33554432
  */
@@ -59,6 +59,7 @@
 #include "QRB/Memory/Sensor/PointCloudDescriptor.hpp"
 #include "QRB/Memory/Vision/ObjectDetection2dDescriptor.hpp"
 #include "QRB/Memory/Vision/ObjectDetection3dDescriptor.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/ipc_adapter_node/hcm_ipc_adapter_node.hpp"
 
 #include <atomic>
@@ -159,6 +160,7 @@ private:
     std::unique_ptr<QCNodeIfs> m_node;
     std::string m_contract;
     bool m_isPointCloud = true;
+    bool m_isImage = false;
     bool m_isHcmToRos = true;
     uint32_t m_bufferId = 0;
     std::string m_inputTopic;
@@ -181,6 +183,7 @@ private:
     uint64_t m_poolExhausted = 0;
 
     static constexpr const char *kPointCloudContract = "qrb.contract.sensor.v1.PointCloud2";
+    static constexpr const char *kImageContract = "qrb.contract.sensor.v1.ImageLayout";
     static constexpr const char *kPoseContract =
             "qrb.contract.geometry.v1.PoseWithCovarianceStamped";
     static constexpr const char *kDetection2DContract = "qrb.contract.vision.v1.Detection2DArray";
@@ -195,6 +198,7 @@ private:
             "qrb.contract.nav.v1.Odometry",
             "qrb.contract.geometry.v1.TwistStamped",
             "qrb.contract.tf2.v1.TFMessage",
+            kImageContract,
             "qrb.contract.sensor.v1.JointState",
             "qrb.contract.geometry.v1.PoseStamped",
             "qrb.contract.geometry.v1.PoseArray",
@@ -210,6 +214,10 @@ private:
     static constexpr uint32_t kSampleDetections = 2;
 
     static constexpr uint32_t kPointStep = 3 * sizeof( float );
+    // An rgb8 image of kImageWidth, its rows ALIGN( width * 3, 16 ) apart as the QCNode Camera
+    // sample allocates them.
+    static constexpr uint32_t kImageWidth = 640;
+    static constexpr uint32_t kImageStride = ( kImageWidth * 3 + 15 ) / 16 * 16;
     static constexpr uint64_t kMaxReportedErrors = 10;
     static constexpr uint32_t kReceiveTimeoutMs = 100;
     // How long to wait after a fetch that found no ROS message, or with every frame held.
@@ -373,6 +381,7 @@ QCStatus_e SampleIpcAdapter::Init( std::string name, SampleConfig_t &config )
     if ( QC_STATUS_OK == ret )
     {
         m_isPointCloud = ( kPointCloudContract == m_contract );
+        m_isImage = ( kImageContract == m_contract );
         if ( nullptr == qrb::adapter::FindHcmContractBinding( m_contract ) )
         {
             QC_ERROR( "contract_type is not mapped by the Adapter: %s", m_contract.c_str() );
@@ -477,6 +486,12 @@ QCStatus_e SampleIpcAdapter::SetupFrames()
         QC_ERROR( "payload_bytes must hold at least one point: %u", bytes );
         return QC_STATUS_BAD_ARGUMENTS;
     }
+    if ( m_isImage && m_isHcmToRos && ( bytes < kImageStride ) )
+    {
+        QC_ERROR( "payload_bytes must hold at least one image row of %u bytes: %u", kImageStride,
+                  bytes );
+        return QC_STATUS_BAD_ARGUMENTS;
+    }
     if ( m_isHcmToRos && ( bytes < DetectionBytes() ) )
     {
         QC_ERROR( "payload_bytes must hold the %u detections of a %s frame, %u bytes: %u",
@@ -541,6 +556,31 @@ void SampleIpcAdapter::FillFrame( ContractFrame &frame )
             (void) transform->frameId.Assign( frames[i][0] );
             (void) transform->childFrameId.Assign( frames[i][1] );
         }
+    }
+
+    auto *image = dynamic_cast<qrb::adapter::ImageHcmDescriptor *>( &frame.Descriptor() );
+    if ( nullptr != image )
+    {
+        // A kImageWidth x ( payload_bytes / kImageStride ) rgb8 Camera frame; UpdateFrame()
+        // draws it.
+        const uint32_t height = m_payloadBytes / kImageStride;
+        image->format = QC_IMAGE_FORMAT_RGB888;
+        image->width = kImageWidth;
+        image->height = height;
+        image->batchSize = 1;
+        image->numPlanes = 1;
+        for ( uint32_t i = 0; i < QC_NUM_IMAGE_PLANES; i++ )
+        {
+            image->stride[i] = 0;
+            image->actualHeight[i] = 0;
+            image->planeBufSize[i] = 0;
+        }
+        image->stride[0] = kImageStride;
+        image->actualHeight[0] = height;
+        image->planeBufSize[0] = kImageStride * height;
+        image->validSize = image->planeBufSize[0];
+        image->timestampQGPTP = 0;
+        image->flags = 0;
     }
 
     auto *joints = dynamic_cast<QRB::Memory::JointStateBufferDescriptor_t *>( &frame.Descriptor() );
@@ -724,6 +764,24 @@ void SampleIpcAdapter::UpdateFrame( ContractFrame &frame )
         // Turn in place, faster with every frame and back to rest every 100 frames.
         twist->timestampNs = nowNs;
         twist->twist.angular.z = (double) ( m_frames % 100 ) * 0.01;
+    }
+
+    auto *image = dynamic_cast<qrb::adapter::ImageHcmDescriptor *>( &frame.Descriptor() );
+    if ( ( nullptr != image ) && ( nullptr != image->pBuf ) )
+    {
+        // Camera frames carry the qtimer, which the Adapter converts to ROS time. Red rises
+        // across the image and scrolls by 4 pixels per frame, green rises down it.
+        image->timestamp = qrb::adapter::SampleHcmClocks().qtimerNs;
+        uint8_t *row = static_cast<uint8_t *>( image->GetDataPtr() );
+        for ( uint32_t y = 0; y < image->height; y++, row += image->stride[0] )
+        {
+            for ( uint32_t x = 0; x < image->width; x++ )
+            {
+                row[x * 3] = (uint8_t) ( x + m_frames * 4 );
+                row[x * 3 + 1] = (uint8_t) y;
+                row[x * 3 + 2] = 128;
+            }
+        }
     }
 
     auto *tf = dynamic_cast<QRB::Memory::TFMessageDescriptor_t *>( &frame.Descriptor() );

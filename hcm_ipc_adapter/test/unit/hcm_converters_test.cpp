@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/joint_state_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
@@ -20,6 +21,7 @@
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/twist_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/vector3_stamped_hcm_converter.hpp"
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
+#include "qrb_ros_adapter/ipc_runtime/contract_validation.hpp"
 
 using namespace qrb::adapter;
 
@@ -457,6 +459,56 @@ TEST(HcmConverters, TFMessageRoundTripsThroughTheBufferAndRejectsWhatItCannotHol
 namespace
 {
 
+// Fixed clocks: qtimer 1000 s after boot pairs with ROS time 1700000000 s.
+constexpr std::uint64_t kSecond = 1000000000ULL;
+constexpr std::uint64_t kQtimerNowNs = 1000 * kSecond;
+constexpr std::uint64_t kRealtimeNowNs = 1700000000 * kSecond;
+
+HcmClockSample FixedClocks()
+{
+  return HcmClockSample{kQtimerNowNs, kRealtimeNowNs};
+}
+
+/** @brief A 64x32 nv12 Image from ROS: empty planes, the aligned ROS layout. */
+ImageHcmContract MakeImage()
+{
+  ImageHcmContract image;
+  image.mutable_header()->mutable_stamp()->set_sec(1700000001);
+  image.mutable_header()->mutable_stamp()->set_nanosec(5);
+  image.mutable_header()->set_frame_id("camera");
+  image.set_width(64);
+  image.set_height(32);
+  image.set_encoding("nv12");
+  image.set_step(64);
+  return image;
+}
+
+/** @brief A Camera frame over heap storage, laid out as the host allocated it. */
+struct HeapCameraFrame
+{
+  HeapCameraFrame(std::uint32_t stride, std::size_t capacity) : storage(capacity, 0x11)
+  {
+    descriptor.pBuf = storage.data();
+    descriptor.size = capacity;
+    descriptor.offset = 0;
+    descriptor.validSize = capacity;
+    descriptor.format = QC::QC_IMAGE_FORMAT_NV12;
+    descriptor.width = 64;
+    descriptor.height = 32;
+    descriptor.batchSize = 1;
+    descriptor.numPlanes = 2;
+    descriptor.stride[0] = descriptor.stride[1] = stride;
+    descriptor.actualHeight[0] = 32;
+    descriptor.actualHeight[1] = 16;
+    descriptor.planeBufSize[0] = stride * 32;
+    descriptor.planeBufSize[1] = stride * 16;
+    descriptor.timestamp = 0;
+  }
+
+  std::vector<std::uint8_t> storage;
+  ImageHcmDescriptor descriptor;
+};
+
 JointStateHcmContract MakeJointState(std::uint32_t count)
 {
   JointStateHcmContract message;
@@ -487,6 +539,78 @@ struct HeapJointDescriptor
 };
 
 }  // namespace
+
+// UT-HCM-06: An ImageLayout from ROS lands in the rows of the host's own Camera
+// frame layout, the descriptor's planes and stamp travel back to ROS, and the
+// camera qtimer converts to and from ROS time.
+TEST(HcmConverters, ImageKeepsTheHostLayoutAndConvertsTheQtimer)
+{
+  const HcmClockSampler previous = SetHcmClockSampler(&FixedClocks);
+  const ImageHcmContract source = MakeImage();
+  ImageLayout ros;
+  ASSERT_TRUE(ResolveImageLayout(source, std::numeric_limits<std::uint64_t>::max(), ros));
+  std::vector<std::uint8_t> payload(ros.storageSize, 0);
+  for (std::size_t p = 0; p < ros.planeCount; ++p)
+    for (std::uint64_t row = 0; row < ros.planes[p].rows; ++row)
+      std::memset(payload.data() + ros.planes[p].offset + row * ros.planes[p].stride,
+          static_cast<int>(p * 64 + row + 1), ros.planes[p].rowBytes);
+
+  // A tight host layout, smaller than the aligned ROS one, keeps its own stride.
+  HeapCameraFrame host(64, 64 * 48);
+  ASSERT_LT(host.storage.size(), ros.storageSize);
+  ASSERT_TRUE((ConvertContractToHcm<ImageHcmContract, ImageHcmDescriptor>(
+      source, DmaBufView{payload.data(), payload.size()}, host.descriptor)));
+  EXPECT_EQ(host.descriptor.stride[0], 64u);
+  EXPECT_EQ(host.descriptor.validSize, 64u * 48);
+  EXPECT_EQ(host.descriptor.timestamp, kQtimerNowNs + kSecond + 5);
+  EXPECT_EQ(host.storage[0], 1);              // Y row 0
+  EXPECT_EQ(host.storage[64 * 31], 32);       // Y row 31
+  EXPECT_EQ(host.storage[64 * 32], 65);       // UV row 0, right after the Y plane
+  EXPECT_EQ(host.storage[64 * 47 + 63], 80);  // UV row 15
+
+  ImageHcmContract back;
+  back.mutable_header()->set_frame_id("stale");
+  ASSERT_TRUE((ConvertHcmToContract<ImageHcmContract, ImageHcmDescriptor>(host.descriptor, back)));
+  EXPECT_EQ(back.header().stamp().SerializeAsString(), source.header().stamp().SerializeAsString());
+  EXPECT_TRUE(back.header().frame_id().empty());  // Camera frames carry no frame ID
+  EXPECT_EQ(back.encoding(), "nv12");
+  EXPECT_EQ(back.step(), 64u);
+  EXPECT_EQ(back.batch_size(), 1u);
+  ASSERT_EQ(back.planes_size(), 2);
+  EXPECT_EQ(back.planes(1).stride(), 64u);
+  EXPECT_EQ(back.planes(1).buffer_size(), 64u * 16);
+
+  // A descriptor with no layout adopts the aligned ROS one.
+  std::vector<std::uint8_t> storage(ros.storageSize, 0);
+  ImageHcmDescriptor bare;
+  bare.pBuf = storage.data();
+  bare.size = storage.size();
+  ASSERT_TRUE((ConvertContractToHcm<ImageHcmContract, ImageHcmDescriptor>(
+      source, DmaBufView{payload.data(), payload.size()}, bare)));
+  EXPECT_EQ(bare.numPlanes, 2u);
+  EXPECT_EQ(bare.stride[0], ros.planes[0].stride);
+  EXPECT_EQ(storage, payload);
+
+  // A ROS time at boot has no qtimer value; a layout that cannot hold the image,
+  // or a format ROS does not carry, is rejected and the buffer stays untouched.
+  ImageHcmContract atBoot = source;
+  atBoot.mutable_header()->mutable_stamp()->set_sec(1700000000 - 1000);
+  atBoot.mutable_header()->mutable_stamp()->set_nanosec(0);
+  HeapCameraFrame untouched(64, 64 * 48);
+  EXPECT_FALSE((ConvertContractToHcm<ImageHcmContract, ImageHcmDescriptor>(
+      atBoot, DmaBufView{payload.data(), payload.size()}, untouched.descriptor)));
+  HeapCameraFrame small(64, 64 * 48 - 1);
+  EXPECT_FALSE((ConvertContractToHcm<ImageHcmContract, ImageHcmDescriptor>(
+      source, DmaBufView{payload.data(), payload.size()}, small.descriptor)));
+  EXPECT_EQ(untouched.storage, std::vector<std::uint8_t>(64 * 48, 0x11));
+  EXPECT_EQ(small.storage, std::vector<std::uint8_t>(64 * 48 - 1, 0x11));
+  host.descriptor.format = QC::QC_IMAGE_FORMAT_UYVY;
+  EXPECT_FALSE((ConvertHcmToContract<ImageHcmContract, ImageHcmDescriptor>(host.descriptor, back)));
+  host.descriptor.format = QC::QC_IMAGE_FORMAT_NV12;
+  host.descriptor.timestamp = 0;
+  EXPECT_FALSE((ConvertHcmToContract<ImageHcmContract, ImageHcmDescriptor>(host.descriptor, back)));
+  SetHcmClockSampler(previous);
+}
 
 // UT-HCM-06: JointState keeps the parallel arrays and bounds its aligned host records.
 TEST(HcmConverters, JointStateRoundTripsThroughHostStorageAndRejectsInvalidFrames)
