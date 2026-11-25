@@ -336,6 +336,49 @@ inline FrameReading CheckTriple(const double * values,
   return reading;
 }
 
+// --- detection frames ----------------------------------------------------------
+//
+// The frame both sides build and check for the detection Contracts: two detections, the first
+// with two hypotheses and the second with one. The probe is the array of 36 doubles of the
+// covariance of the first hypothesis of the first detection; the Contract keeps a covariance that
+// is not all zero. Every other value is exact in a double, so it must arrive unchanged.
+//
+
+namespace detection_probe
+{
+
+constexpr const char * kFrameId = "stream_probe";
+constexpr std::size_t kDetections = 2;
+constexpr std::size_t kCovarianceDoubles = 36;
+
+inline const char * Id(std::size_t detection)
+{
+  return detection == 0 ? "probe-0" : "probe-1";
+}
+
+inline std::size_t HypothesisCount(std::size_t detection)
+{
+  return detection == 0 ? 2 : 1;
+}
+
+inline const char * ClassId(std::size_t detection, std::size_t hypothesis)
+{
+  return detection == 0 ? (hypothesis == 0 ? "probe-a" : "probe-b") : "probe-c";
+}
+
+inline double Score(std::size_t detection, std::size_t hypothesis)
+{
+  return detection == 0 ? (hypothesis == 0 ? 0.75 : 0.25) : 0.5;
+}
+
+/** @brief Number `component` of the bounding box of `detection`, in the order of its fields. */
+inline double BoxValue(std::size_t detection, std::size_t component)
+{
+  return 10.0 * static_cast<double>(detection + 1) + 0.5 * static_cast<double>(component);
+}
+
+}  // namespace detection_probe
+
 // --- DMA-BUF mapping -------------------------------------------------------------
 
 /**

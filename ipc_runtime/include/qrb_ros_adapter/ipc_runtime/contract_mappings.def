@@ -5,6 +5,8 @@
 // expanded independently by the shared, HCM and ROS registries.
 
 #if defined( QRB_CONTRACT_MAPPING_INCLUDE_HCM_HEADERS )
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_2d_hcm_converter.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_3d_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/joint_state_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
@@ -17,6 +19,8 @@
 #endif
 
 #if defined( QRB_CONTRACT_MAPPING_INCLUDE_ROS_HEADERS )
+#include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/detection_2d_ros_converter.hpp"
+#include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/detection_3d_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/joint_state_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/odometry_ros_converter.hpp"
 #include "qrb_ros_adapter/ros_ipc_bridge/flow_bridge/point_cloud_ros_converter.hpp"
@@ -87,4 +91,18 @@ QRB_CONTRACT_MAPPING( Vector3Stamped,
     ::qrb::contract::geometry::v1::Vector3Stamped,
     ::qrb::adapter::Vector3StampedHcmDescriptor,
     ::qrb::adapter::Vector3StampedRosMessage, "vector3_stamped_bridge" )
+
+// Detections are Inline Contracts: the Contract carries every detection. The HCM descriptor keeps
+// its fixed-size records in its own buffer, which the HCM converter reads or fills.
+QRB_CONTRACT_MAPPING( Detection2DArray,
+    "qrb.contract.vision.v1.Detection2DArray", Inline,
+    ::qrb::contract::vision::v1::Detection2DArray,
+    ::qrb::adapter::Detection2DHcmDescriptor,
+    ::qrb::adapter::Detection2DRosMessage, "detection2d_bridge" )
+
+QRB_CONTRACT_MAPPING( Detection3DArray,
+    "qrb.contract.vision.v1.Detection3DArray", Inline,
+    ::qrb::contract::vision::v1::Detection3DArray,
+    ::qrb::adapter::Detection3DHcmDescriptor,
+    ::qrb::adapter::Detection3DRosMessage, "detection3d_bridge" )
 #endif

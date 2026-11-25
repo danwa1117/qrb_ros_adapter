@@ -26,8 +26,9 @@
  *   contract_type : (optional) a mapped Contract, default qrb.contract.sensor.v1.PointCloud2
  *   direction     : (optional) 0: HCM to ROS (default), 1: ROS to HCM
  *   ros_topic     : (optional) default /qrb_ros_adapter/sample/points for PointCloud2,
- *                   .../pose for PoseWithCovarianceStamped, else .../<message name in snake_case,
- *                   e.g. odometry for Odometry>
+ *                   .../pose for PoseWithCovarianceStamped, .../detections_2d and
+ *                   .../detections_3d for Detection2DArray and Detection3DArray, else
+ *                   .../<message name in snake_case, e.g. odometry for Odometry>
  *   reliability   : (optional) reliable or best_effort, default the ROS default
  *   durability    : (optional) volatile or transient_local, default the ROS default
  *   depth         : (optional) 1..32, default the ROS default
@@ -35,9 +36,11 @@
  *   output_topic  : (optional) direction 1: the topic to publish the fetched frames on
  *   pool_size     : (optional) frames to fetch into with output_topic, 1..32, default 4
  *   fps           : (optional) frames per second, 0 for no pause, default 30
- *   payload_bytes : (optional) bytes of points sent to ROS, for PointCloud2, default 1048576
- *   buffer_bytes  : (optional) direction 1, for a DmaBuf Contract: size of the DMA buffer the
- *                   sample receives into, default 33554432
+ *   payload_bytes : (optional) bytes of points sent to ROS, for PointCloud2, default 1048576;
+ *                   for Detection2DArray and Detection3DArray, the buffer that holds the two
+ *                   detections the sample sends
+ *   buffer_bytes  : (optional) direction 1, for a DmaBuf Contract and for the detections: size of
+ *                   the DMA buffer the sample receives into, default 33554432
  */
 
 #include "ContractFrame.hpp"
@@ -54,10 +57,13 @@
 #include "QRB/Memory/Navigation/OdometryDescriptor.hpp"
 #include "QRB/Memory/Sensor/JointStateBufferDescriptor.hpp"
 #include "QRB/Memory/Sensor/PointCloudDescriptor.hpp"
+#include "QRB/Memory/Vision/ObjectDetection2dDescriptor.hpp"
+#include "QRB/Memory/Vision/ObjectDetection3dDescriptor.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/ipc_adapter_node/hcm_ipc_adapter_node.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -92,6 +98,33 @@ static const char *StateName( QCObjectState_e state )
         default:
             return "OTHER";
     }
+}
+
+/** Copy @p text into a char array of a detection record, cut to fit and always NUL-terminated. */
+template<size_t N>
+static void SetText( char ( &dest )[N], const char *text )
+{
+    (void) snprintf( dest, N, "%s", text );
+}
+
+/** Add the class @p classId with @p score to @p record, with its pose at the frame's origin. */
+template<typename RecordT>
+static void AddHypothesis( RecordT &record, const char *classId, double score )
+{
+    if ( record.resultCount < QRB_DETECTION_MAX_RESULTS )
+    {
+        QRB::Memory::ObjectHypothesisRaw_t &result = record.results[record.resultCount++];
+        SetText( result.classId, classId );
+        result.score = score;
+    }
+}
+
+/** Whether the buffer of @p descriptor holds @p count detections from its offset on. */
+template<typename DescriptorT>
+static bool FitsDetections( const DescriptorT &descriptor, uint32_t count )
+{
+    return ( nullptr != descriptor.pBuf ) &&
+           ( descriptor.size >= descriptor.offset + DescriptorT::CalcBufferSize( count ) );
 }
 
 class SampleIpcAdapter : public SampleIF
@@ -150,6 +183,8 @@ private:
     static constexpr const char *kPointCloudContract = "qrb.contract.sensor.v1.PointCloud2";
     static constexpr const char *kPoseContract =
             "qrb.contract.geometry.v1.PoseWithCovarianceStamped";
+    static constexpr const char *kDetection2DContract = "qrb.contract.vision.v1.Detection2DArray";
+    static constexpr const char *kDetection3DContract = "qrb.contract.vision.v1.Detection3DArray";
     /**
      * The Contracts FillFrame() / UpdateFrame() can fill, so the sample sends them without
      * input_topic. To add one, add it here and give both a case for its descriptor.
@@ -164,8 +199,15 @@ private:
             "qrb.contract.geometry.v1.PoseStamped",
             "qrb.contract.geometry.v1.PoseArray",
             "qrb.contract.geometry.v1.Vector3Stamped",
+            kDetection2DContract,
+            kDetection3DContract,
     };
     bool IsFilledContract() const;
+    /** Bytes the two detections of the sample take in a buffer, 0 for another Contract. */
+    uint32_t DetectionBytes() const;
+
+    // The detections of a frame the sample fills, in the buffer of the frame.
+    static constexpr uint32_t kSampleDetections = 2;
 
     static constexpr uint32_t kPointStep = 3 * sizeof( float );
     static constexpr uint64_t kMaxReportedErrors = 10;
@@ -220,6 +262,21 @@ bool SampleIpcAdapter::IsFilledContract() const
     return false;
 }
 
+uint32_t SampleIpcAdapter::DetectionBytes() const
+{
+    if ( kDetection2DContract == m_contract )
+    {
+        return (uint32_t) QRB::Memory::ObjectDetection2dDescriptor_t::CalcBufferSize(
+                kSampleDetections );
+    }
+    if ( kDetection3DContract == m_contract )
+    {
+        return (uint32_t) QRB::Memory::ObjectDetection3dDescriptor_t::CalcBufferSize(
+                kSampleDetections );
+    }
+    return 0;
+}
+
 std::string SampleIpcAdapter::DefaultTopic() const
 {
     std::string topic = "/qrb_ros_adapter/sample/";
@@ -230,6 +287,14 @@ std::string SampleIpcAdapter::DefaultTopic() const
     if ( kPoseContract == m_contract )
     {
         return topic + "pose";
+    }
+    if ( kDetection2DContract == m_contract )
+    {
+        return topic + "detections_2d";
+    }
+    if ( kDetection3DContract == m_contract )
+    {
+        return topic + "detections_3d";
     }
 
     // The message name of the Contract in snake_case, e.g. Odometry: odometry.
@@ -412,6 +477,12 @@ QCStatus_e SampleIpcAdapter::SetupFrames()
         QC_ERROR( "payload_bytes must hold at least one point: %u", bytes );
         return QC_STATUS_BAD_ARGUMENTS;
     }
+    if ( m_isHcmToRos && ( bytes < DetectionBytes() ) )
+    {
+        QC_ERROR( "payload_bytes must hold the %u detections of a %s frame, %u bytes: %u",
+                  kSampleDetections, m_contract.c_str(), DetectionBytes(), bytes );
+        return QC_STATUS_BAD_ARGUMENTS;
+    }
 
     if ( !m_outputTopic.empty() )
     {
@@ -518,6 +589,70 @@ void SampleIpcAdapter::FillFrame( ContractFrame &frame )
         vector3->vector.z = -1.0;
     }
 
+    // The records of the two detections go into the DMA-BUF of the frame once, as the points of
+    // a cloud do; UpdateFrame() only moves the stamp.
+    auto *detections2d =
+            dynamic_cast<QRB::Memory::ObjectDetection2dDescriptor_t *>( &frame.Descriptor() );
+    if ( ( nullptr != detections2d ) && FitsDetections( *detections2d, kSampleDetections ) )
+    {
+        // A person and a cup, in the pixels of an image.
+        QRB::Memory::Detection2dRaw_t person{};
+        SetText( person.id, "track-1" );
+        person.bbox.center.position.x = 320.0;
+        person.bbox.center.position.y = 240.0;
+        person.bbox.sizeX = 64.0;
+        person.bbox.sizeY = 128.0;
+        AddHypothesis( person, "person", 0.9 );
+
+        QRB::Memory::Detection2dRaw_t cup{};
+        SetText( cup.id, "track-2" );
+        cup.bbox.center.position.x = 480.0;
+        cup.bbox.center.position.y = 300.0;
+        cup.bbox.sizeX = 40.0;
+        cup.bbox.sizeY = 40.0;
+        AddHypothesis( cup, "cup", 0.6 );
+        AddHypothesis( cup, "bottle", 0.3 );
+
+        (void) detections2d->frameId.Assign( "camera" );
+        *detections2d->GetDetectionPtr( 0 ) = person;
+        *detections2d->GetDetectionPtr( 1 ) = cup;
+        detections2d->objCount = kSampleDetections;
+        detections2d->validSize =
+                QRB::Memory::ObjectDetection2dDescriptor_t::CalcBufferSize( kSampleDetections );
+    }
+
+    auto *detections3d =
+            dynamic_cast<QRB::Memory::ObjectDetection3dDescriptor_t *>( &frame.Descriptor() );
+    if ( ( nullptr != detections3d ) && FitsDetections( *detections3d, kSampleDetections ) )
+    {
+        // A car and a person, in meters.
+        QRB::Memory::Detection3dRaw_t car{};
+        SetText( car.id, "track-1" );
+        car.bbox.center.position.x = 5.0;
+        car.bbox.center.position.z = 0.75;
+        car.bbox.size.x = 4.5;
+        car.bbox.size.y = 2.0;
+        car.bbox.size.z = 1.5;
+        AddHypothesis( car, "car", 0.85 );
+
+        QRB::Memory::Detection3dRaw_t person{};
+        SetText( person.id, "track-2" );
+        person.bbox.center.position.x = 2.0;
+        person.bbox.center.position.y = 1.0;
+        person.bbox.center.position.z = 0.9;
+        person.bbox.size.x = 0.6;
+        person.bbox.size.y = 0.6;
+        person.bbox.size.z = 1.8;
+        AddHypothesis( person, "person", 0.7 );
+
+        (void) detections3d->frameId.Assign( "base_link" );
+        *detections3d->GetDetectionPtr( 0 ) = car;
+        *detections3d->GetDetectionPtr( 1 ) = person;
+        detections3d->objCount = kSampleDetections;
+        detections3d->validSize =
+                QRB::Memory::ObjectDetection3dDescriptor_t::CalcBufferSize( kSampleDetections );
+    }
+
     auto *cloud = dynamic_cast<QRB::Memory::PointCloudDescriptor_t *>( &frame.Descriptor() );
     if ( nullptr == cloud )
     {
@@ -555,6 +690,14 @@ void SampleIpcAdapter::UpdateFrame( ContractFrame &frame )
     if ( nullptr != cloud )
     {
         cloud->timestampNs = nowNs;
+    }
+
+    // Both detection descriptors share this base, which holds the stamp.
+    auto *detections =
+            dynamic_cast<QRB::Memory::ObjectDetectionDescriptor_t *>( &frame.Descriptor() );
+    if ( nullptr != detections )
+    {
+        detections->timestampNs = nowNs;
     }
 
     auto *pose = dynamic_cast<QRB::Memory::PoseWithCovarianceDescriptor_t *>( &frame.Descriptor() );

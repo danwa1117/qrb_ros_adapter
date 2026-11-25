@@ -16,6 +16,7 @@ using namespace qrb::adapter;
 
 namespace geometry_proto = ::qrb::contract::geometry::v1;
 namespace sensor_proto = ::qrb::contract::sensor::v1;
+namespace vision_proto = ::qrb::contract::vision::v1;
 
 namespace
 {
@@ -639,4 +640,157 @@ TEST(ContractValidation, RejectsInvalidVector3Stamped)
     EXPECT_FALSE(rejected);
     EXPECT_FALSE(rejected.Diagnostic().empty());
   }
+}
+
+namespace
+{
+
+void FillHypothesis(vision_proto::ObjectHypothesisWithPose * result,
+    const char * classId,
+    double score,
+    bool withCovariance)
+{
+  result->mutable_hypothesis()->set_class_id(classId);
+  result->mutable_hypothesis()->set_score(score);
+  result->mutable_pose()->mutable_pose()->mutable_orientation()->set_w(1.0);
+  if (withCovariance) {
+    for (int i = 0; i < 36; ++i)
+      result->mutable_pose()->add_covariance(0.5 * i);
+  }
+}
+
+vision_proto::Detection2DArray MakeDetections2D()
+{
+  vision_proto::Detection2DArray array;
+  array.mutable_header()->mutable_stamp()->set_sec(3);
+  array.mutable_header()->set_frame_id("camera");
+  auto * first = array.add_detections();
+  first->set_id("track-1");
+  first->mutable_bbox()->mutable_center()->mutable_position()->set_x(320.5);
+  first->mutable_bbox()->mutable_center()->mutable_position()->set_y(240.0);
+  first->mutable_bbox()->mutable_center()->set_theta(0.25);
+  first->mutable_bbox()->set_size_x(64.0);
+  first->mutable_bbox()->set_size_y(32.0);
+  FillHypothesis(first->add_results(), "person", 0.9, false);
+  FillHypothesis(first->add_results(), "mannequin", 0.1, true);
+  auto * second = array.add_detections();
+  second->mutable_bbox()->set_size_x(8.0);
+  FillHypothesis(second->add_results(), "cup", 0.5, false);
+  return array;
+}
+
+vision_proto::Detection3DArray MakeDetections3D()
+{
+  vision_proto::Detection3DArray array;
+  array.mutable_header()->set_frame_id("lidar");
+  auto * detection = array.add_detections();
+  detection->set_id("car-7");
+  detection->mutable_bbox()->mutable_center()->mutable_position()->set_z(1.0);
+  detection->mutable_bbox()->mutable_center()->mutable_orientation()->set_w(1.0);
+  detection->mutable_bbox()->mutable_size()->set_x(4.0);
+  detection->mutable_bbox()->mutable_size()->set_y(2.0);
+  detection->mutable_bbox()->mutable_size()->set_z(1.5);
+  FillHypothesis(detection->add_results(), "car", 0.8, true);
+  return array;
+}
+
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+}  // namespace
+
+// UT-IPC-10: a detection array is valid when every number is finite, the strings fit and the
+// optional parts are consistent; the check names the detection that failed. An empty array
+// ("nothing detected") and a box without orientation are valid.
+TEST(ContractValidation, AcceptsDetectionArraysAndRejectsInvalidDetections)
+{
+  EXPECT_TRUE(ValidateDetection2DArray(MakeDetections2D()));
+  EXPECT_TRUE(ValidateDetection3DArray(MakeDetections3D()));
+
+  vision_proto::Detection2DArray empty2d;
+  empty2d.mutable_header()->set_frame_id("camera");
+  EXPECT_TRUE(ValidateDetection2DArray(empty2d));
+  vision_proto::Detection3DArray empty3d;
+  EXPECT_TRUE(ValidateDetection3DArray(empty3d));
+
+  // Publishers that never set the quaternions send all zeros; it is passed on as it is.
+  vision_proto::Detection3DArray unnormalized = MakeDetections3D();
+  unnormalized.mutable_detections(0)->mutable_bbox()->mutable_center()->clear_orientation();
+  EXPECT_TRUE(ValidateDetection3DArray(unnormalized));
+  // A hypothesis without pose reads as the identity.
+  vision_proto::Detection2DArray noPose = MakeDetections2D();
+  noPose.mutable_detections(1)->mutable_results(0)->clear_pose();
+  EXPECT_TRUE(ValidateDetection2DArray(noPose));
+
+  const auto invalid2d = [](const char * what, auto && mutate) {
+    vision_proto::Detection2DArray array = MakeDetections2D();
+    mutate(array);
+    const ConversionResult result = ValidateDetection2DArray(array);
+    EXPECT_FALSE(result) << what;
+    EXPECT_FALSE(result.Diagnostic().empty()) << what;
+    return result.Diagnostic();
+  };
+  invalid2d("bad header", [](auto & a) { a.mutable_header()->set_frame_id("/camera"); });
+  invalid2d(
+      "nanosec", [](auto & a) { a.mutable_header()->mutable_stamp()->set_nanosec(1000000000u); });
+  invalid2d("no bbox", [](auto & a) { a.mutable_detections(1)->clear_bbox(); });
+  invalid2d("nan center", [](auto & a) {
+    a.mutable_detections(0)->mutable_bbox()->mutable_center()->mutable_position()->set_x(kNaN);
+  });
+  invalid2d("inf theta",
+      [](auto & a) { a.mutable_detections(0)->mutable_bbox()->mutable_center()->set_theta(kInf); });
+  invalid2d(
+      "negative size", [](auto & a) { a.mutable_detections(0)->mutable_bbox()->set_size_y(-1.0); });
+  invalid2d(
+      "nan size", [](auto & a) { a.mutable_detections(0)->mutable_bbox()->set_size_x(kNaN); });
+  invalid2d("long id", [](auto & a) { a.mutable_detections(0)->set_id(std::string(256, 'i')); });
+  invalid2d("nul id", [](auto & a) { a.mutable_detections(0)->set_id(std::string("a\0b", 3)); });
+  invalid2d("long class", [](auto & a) {
+    auto * hypothesis = a.mutable_detections(0)->mutable_results(0)->mutable_hypothesis();
+    hypothesis->set_class_id(std::string(256, 'c'));
+  });
+  invalid2d("nul class", [](auto & a) {
+    auto * hypothesis = a.mutable_detections(0)->mutable_results(0)->mutable_hypothesis();
+    hypothesis->set_class_id(std::string("a\0b", 3));
+  });
+  invalid2d("nan score", [](auto & a) {
+    a.mutable_detections(0)->mutable_results(0)->mutable_hypothesis()->set_score(kNaN);
+  });
+  invalid2d("no hypothesis",
+      [](auto & a) { a.mutable_detections(0)->mutable_results(0)->clear_hypothesis(); });
+  invalid2d("nan pose", [](auto & a) {
+    auto * pose = a.mutable_detections(0)->mutable_results(0)->mutable_pose();
+    pose->mutable_pose()->mutable_position()->set_y(kNaN);
+  });
+  invalid2d("short covariance", [](auto & a) {
+    a.mutable_detections(0)->mutable_results(0)->mutable_pose()->add_covariance(1.0);
+  });
+  invalid2d("nan covariance", [](auto & a) {
+    a.mutable_detections(0)->mutable_results(1)->mutable_pose()->set_covariance(3, kNaN);
+  });
+  // The failure names the detection, so the bad one can be found.
+  const std::string second =
+      invalid2d("second", [](auto & a) { a.mutable_detections(1)->clear_bbox(); });
+  EXPECT_NE(second.find("detection 1"), std::string::npos);
+
+  const auto invalid3d = [](const char * what, auto && mutate) {
+    vision_proto::Detection3DArray array = MakeDetections3D();
+    mutate(array);
+    EXPECT_FALSE(ValidateDetection3DArray(array)) << what;
+  };
+  invalid3d("no bbox", [](auto & a) { a.mutable_detections(0)->clear_bbox(); });
+  invalid3d("nan center", [](auto & a) {
+    a.mutable_detections(0)->mutable_bbox()->mutable_center()->mutable_position()->set_x(kNaN);
+  });
+  invalid3d("inf orientation", [](auto & a) {
+    a.mutable_detections(0)->mutable_bbox()->mutable_center()->mutable_orientation()->set_x(kInf);
+  });
+  invalid3d("negative size",
+      [](auto & a) { a.mutable_detections(0)->mutable_bbox()->mutable_size()->set_z(-0.5); });
+  invalid3d("nan size",
+      [](auto & a) { a.mutable_detections(0)->mutable_bbox()->mutable_size()->set_x(kNaN); });
+  invalid3d("bad class", [](auto & a) {
+    auto * hypothesis = a.mutable_detections(0)->mutable_results(0)->mutable_hypothesis();
+    hypothesis->set_class_id(std::string(300, 'c'));
+  });
 }

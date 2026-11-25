@@ -18,6 +18,7 @@
 #include "QRB/Memory/Geometry/PoseArrayDescriptor.hpp"
 #include "QRB/Memory/Geometry/TFMessageDescriptor.hpp"
 #include "QRB/Memory/Sensor/JointStateBufferDescriptor.hpp"
+#include "QRB/Memory/Vision/ObjectDetectionDescriptor.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_converters.hpp"
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
 
@@ -115,8 +116,11 @@ public:
         }
         // A DMA-BUF Contract keeps its data in a buffer of its own.
         auto *buffer = dynamic_cast<Memory::BufferDescriptor_t *>( created.get() );
-        if ( ( qrb::adapter::PayloadClass::kDmaBuf == binding->descriptor->payloadClass ) &&
-             ( nullptr != buffer ) )
+        const bool keepsData =
+                ( qrb::adapter::PayloadClass::kDmaBuf == binding->descriptor->payloadClass ) ||
+                ( nullptr !=
+                  dynamic_cast<QRB::Memory::ObjectDetectionDescriptor_t *>( created.get() ) );
+        if ( keepsData && ( nullptr != buffer ) )
         {
             if ( 0 == bufferBytes )
             {

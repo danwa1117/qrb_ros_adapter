@@ -17,6 +17,8 @@
 #include "qrb/contract/sensor/v1/joint_state.pb.h"
 #include "qrb/contract/sensor/v1/point_cloud2.pb.h"
 #include "qrb/contract/tf2/v1/tf_message.pb.h"
+#include "qrb/contract/vision/v1/detection_2d_array.pb.h"
+#include "qrb/contract/vision/v1/detection_3d_array.pb.h"
 #include "qrb_ros_adapter/ipc_runtime/contract_limits.hpp"
 #include "qrb_ros_adapter/ipc_runtime/conversion_result.hpp"
 
@@ -70,6 +72,21 @@ ConversionResult ValidateVector3Stamped(const qrb::contract::geometry::v1::Vecto
 
 ConversionResult ValidatePointCloud2(const qrb::contract::sensor::v1::PointCloud2 & cloud,
     std::uint64_t externalPayloadSize);
+
+/**
+ * @brief Checks a detection array a peer sent or this side built.
+ *
+ * Every number must be finite and every box size non-negative; `id` and `class_id` must fit
+ * contract_limits::kMaxDetectionStringLength and hold no NUL; a covariance is empty (unknown)
+ * or has 36 values. The detector may leave the quaternions of a box or a hypothesis pose
+ * unnormalized, or all zero, since many publishers never set them; they are passed on as
+ * they are. An empty array is valid: "nothing detected" is a result.
+ */
+ConversionResult ValidateDetection2DArray(
+    const qrb::contract::vision::v1::Detection2DArray & detections);
+
+ConversionResult ValidateDetection3DArray(
+    const qrb::contract::vision::v1::Detection3DArray & detections);
 
 }  // namespace qrb::adapter
 

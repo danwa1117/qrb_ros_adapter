@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_2d_hcm_converter.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_3d_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_converters.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/joint_state_hcm_converter.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
@@ -99,6 +101,23 @@ TEST(HcmContractBinding, EveryContractHasOneCompleteBindingAndAMatchingFactory)
   EXPECT_FALSE(tf.contractToHcm(tfContract, DmaBufView{}, twistDescriptor));
   EXPECT_FALSE(tf.hcmToContract(twistDescriptor, tfContract));
 
+  // The 2-D and 3-D detection descriptors share a base class and a buffer type, but a binding
+  // takes only its own.
+  const HcmContractBinding & detection2d = *FindHcmContractBinding(kDetection2DArrayContractType);
+  const HcmContractBinding & detection3d = *FindHcmContractBinding(kDetection3DArrayContractType);
+  Detection2DHcmDescriptor descriptor2d;
+  Detection3DHcmDescriptor descriptor3d;
+  Detection2DHcmContract contract2d;
+  Detection3DHcmContract contract3d;
+  EXPECT_TRUE(detection2d.acceptsDescriptor(descriptor2d));
+  EXPECT_FALSE(detection2d.acceptsDescriptor(descriptor3d));
+  EXPECT_TRUE(detection3d.acceptsDescriptor(descriptor3d));
+  EXPECT_FALSE(detection3d.acceptsDescriptor(descriptor2d));
+  EXPECT_FALSE(detection2d.contractToHcm(contract2d, DmaBufView{}, descriptor3d));
+  EXPECT_FALSE(detection2d.hcmToContract(descriptor3d, contract2d));
+  EXPECT_FALSE(detection3d.contractToHcm(contract3d, DmaBufView{}, descriptor2d));
+  EXPECT_FALSE(detection3d.hcmToContract(descriptor2d, contract3d));
+  EXPECT_FALSE(detection2d.contractToHcm(contract3d, DmaBufView{}, descriptor2d));
   // JointState and TFMessage share CUSTOM_4, but their C++ descriptors are distinct.
   const HcmContractBinding & joints = *FindHcmContractBinding(kJointStateContractType);
   JointStateHcmDescriptor jointDescriptor;

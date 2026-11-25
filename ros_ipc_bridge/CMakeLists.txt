@@ -41,7 +41,8 @@ set(QRB_ROS_MSG_DEPENDENCIES
   geometry_msgs
   nav_msgs
   sensor_msgs
-  tf2_msgs)
+  tf2_msgs
+  vision_msgs)
 foreach(_msg_dependency IN LISTS QRB_ROS_MSG_DEPENDENCIES)
   find_package(${_msg_dependency} REQUIRED)
 endforeach()

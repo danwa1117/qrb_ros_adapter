@@ -843,6 +843,160 @@ private:
   }
 };
 
+// --- vision.v1.Detection2DArray and Detection3DArray (inline) -------------------
+
+/** @brief The bounding box, the one thing the 2-D and 3-D detection probes differ in. */
+struct RosBox2d
+{
+  using Box = vision_msgs::msg::BoundingBox2D;
+
+  static void Fill(Box & box, std::size_t detection)
+  {
+    box.center.position.x = detection_probe::BoxValue(detection, 0);
+    box.center.position.y = detection_probe::BoxValue(detection, 1);
+    box.center.theta = detection_probe::BoxValue(detection, 2);
+    box.size_x = detection_probe::BoxValue(detection, 3);
+    box.size_y = detection_probe::BoxValue(detection, 4);
+  }
+
+  static bool Matches(const Box & box, std::size_t detection)
+  {
+    return box.center.position.x == detection_probe::BoxValue(detection, 0) &&
+           box.center.position.y == detection_probe::BoxValue(detection, 1) &&
+           box.center.theta == detection_probe::BoxValue(detection, 2) &&
+           box.size_x == detection_probe::BoxValue(detection, 3) &&
+           box.size_y == detection_probe::BoxValue(detection, 4);
+  }
+};
+
+struct RosBox3d
+{
+  using Box = vision_msgs::msg::BoundingBox3D;
+
+  static void Fill(Box & box, std::size_t detection)
+  {
+    box.center.position.x = detection_probe::BoxValue(detection, 0);
+    box.center.position.y = detection_probe::BoxValue(detection, 1);
+    box.center.position.z = detection_probe::BoxValue(detection, 2);
+    box.center.orientation.w = 1.0;
+    box.size.x = detection_probe::BoxValue(detection, 3);
+    box.size.y = detection_probe::BoxValue(detection, 4);
+    box.size.z = detection_probe::BoxValue(detection, 5);
+  }
+
+  static bool Matches(const Box & box, std::size_t detection)
+  {
+    return box.center.position.x == detection_probe::BoxValue(detection, 0) &&
+           box.center.position.y == detection_probe::BoxValue(detection, 1) &&
+           box.center.position.z == detection_probe::BoxValue(detection, 2) &&
+           box.center.orientation.x == 0.0 && box.center.orientation.y == 0.0 &&
+           box.center.orientation.z == 0.0 && box.center.orientation.w == 1.0 &&
+           box.size.x == detection_probe::BoxValue(detection, 3) &&
+           box.size.y == detection_probe::BoxValue(detection, 4) &&
+           box.size.z == detection_probe::BoxValue(detection, 5);
+  }
+};
+
+/** The frame of detection_probe in a ROS detection array. */
+template <typename Message, typename BoxTraits>
+struct RosDetectionProbe
+{
+  static constexpr std::uint64_t kPayloadBytes =
+      detection_probe::kCovarianceDoubles * sizeof(double);
+
+  class Source
+  {
+  public:
+    Source(std::uint64_t, std::uint32_t, std::uint32_t streamTag) : streamTag_(streamTag) {}
+
+    SendOutcome Next(std::uint64_t sequence,
+        std::unique_ptr<Message> & out,
+        std::uint64_t & sendTimeNs)
+    {
+      out = std::make_unique<Message>();
+      out->header.frame_id = detection_probe::kFrameId;
+      out->detections.resize(detection_probe::kDetections);
+      for (std::size_t i = 0; i < out->detections.size(); ++i) {
+        auto & detection = out->detections[i];
+        detection.id = detection_probe::Id(i);
+        BoxTraits::Fill(detection.bbox, i);
+        detection.results.resize(detection_probe::HypothesisCount(i));
+        for (std::size_t j = 0; j < detection.results.size(); ++j) {
+          auto & result = detection.results[j];
+          result.hypothesis.class_id = detection_probe::ClassId(i, j);
+          result.hypothesis.score = detection_probe::Score(i, j);
+          result.pose.pose.orientation.w = 1.0;
+        }
+      }
+      const std::uint64_t now = MonotonicNowNs();
+      sendTimeNs = now;
+      out->header.stamp.sec = static_cast<std::int32_t>(now / 1000000000ull);
+      out->header.stamp.nanosec = static_cast<std::uint32_t>(now % 1000000000ull);
+      for (auto & detection : out->detections)
+        detection.header = out->header;
+      auto & covariance = out->detections[0].results[0].pose.covariance;
+      StampDoubles(covariance.data(), covariance.size(), streamTag_, sequence, now);
+      return SendOutcome::kSent;
+    }
+
+    std::uint64_t PayloadBytes() const { return kPayloadBytes; }
+
+  private:
+    std::uint32_t streamTag_;
+  };
+
+  static FrameReading Check(const Message & message,
+      std::uint32_t streamTag,
+      std::uint64_t & payloadBytes)
+  {
+    payloadBytes = kPayloadBytes;
+    FrameReading reading;
+    if (message.detections.empty() || message.detections[0].results.empty())
+      return reading;
+    const auto & covariance = message.detections[0].results[0].pose.covariance;
+    reading = CheckDoubles(covariance.data(), covariance.size(), streamTag);
+    if (reading.check == FrameCheck::kOk && !HasLayout(message))
+      reading.check = FrameCheck::kBadLayout;
+    return reading;
+  }
+
+private:
+  static bool HasLayout(const Message & message)
+  {
+    if (message.header.frame_id != detection_probe::kFrameId ||
+        message.detections.size() != detection_probe::kDetections)
+      return false;
+    for (std::size_t i = 0; i < message.detections.size(); ++i) {
+      const auto & detection = message.detections[i];
+      if (detection.id != detection_probe::Id(i) ||
+          detection.header.frame_id != detection_probe::kFrameId ||
+          !BoxTraits::Matches(detection.bbox, i) ||
+          detection.results.size() != detection_probe::HypothesisCount(i))
+        return false;
+      for (std::size_t j = 0; j < detection.results.size(); ++j) {
+        const auto & result = detection.results[j];
+        if (result.hypothesis.class_id != detection_probe::ClassId(i, j) ||
+            result.hypothesis.score != detection_probe::Score(i, j) ||
+            result.pose.pose.orientation.w != 1.0)
+          return false;
+      }
+    }
+    return true;
+  }
+};
+
+template <>
+struct RosProbeSample<adapter::Detection2DRosMessage>
+  : RosDetectionProbe<adapter::Detection2DRosMessage, RosBox2d>
+{
+};
+
+template <>
+struct RosProbeSample<adapter::Detection3DRosMessage>
+  : RosDetectionProbe<adapter::Detection3DRosMessage, RosBox3d>
+{
+};
+
 namespace
 {
 
