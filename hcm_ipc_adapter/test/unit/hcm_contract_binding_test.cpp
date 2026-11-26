@@ -2,59 +2,90 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <climits>
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_2d_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/detection_3d_hcm_converter.hpp"
+#include "QC/Infras/Memory/BufferDescriptor.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_contract_registry.hpp"
 #include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_converters.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/image_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/imu_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/joint_state_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/odometry_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/point_cloud_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/pose_array_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/pose_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/pose_stamped_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/tf_message_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/twist_hcm_converter.hpp"
-#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/vector3_stamped_hcm_converter.hpp"
+#include "qrb_ros_adapter/hcm_ipc_adapter/flow_client/hcm_dma_buffer.hpp"
+#include "qrb_ros_adapter/ipc_runtime/contract_descriptor_registry.hpp"
 
 using namespace qrb::adapter;
 
-// Every shared Contract has exactly one complete HCM binding, and the
-// descriptor factory creates, by Contract name, descriptors only that binding
-// accepts.
-TEST(HcmContractBinding, EveryContractHasOneCompleteBindingAndAMatchingFactory)
+namespace
 {
+
+/** @brief One Contract, with a Contract message and a descriptor of its own types. */
+struct BindingEntry
+{
+  std::string contractType;
+  std::unique_ptr<google::protobuf::MessageLite> contract;
+  std::unique_ptr<QC::Memory::QCBufferDescriptorBase_t> descriptor;
+};
+
+template <typename ContractT, typename DescriptorT>
+BindingEntry MakeBindingEntry(const char * contractType)
+{
+  return BindingEntry{contractType, std::make_unique<ContractT>(), std::make_unique<DescriptorT>()};
+}
+
+std::vector<BindingEntry> MakeEveryBindingEntry()
+{
+  std::vector<BindingEntry> entries;
+#define QRB_CONTRACT_MAPPING(Id, TypeName, Payload, ContractT, DescriptorT, ...)                   \
+  entries.push_back(MakeBindingEntry<ContractT, DescriptorT>(TypeName));
+#include "qrb_ros_adapter/ipc_runtime/contract_mappings.def"
+#undef QRB_CONTRACT_MAPPING
+  return entries;
+}
+
+}  // namespace
+
+// Every Contract has one complete binding that takes only the descriptor and the Contract message
+// of its own Contract, whichever way it converts; the factory creates by name a descriptor its
+// binding accepts and refuses an unknown name.
+TEST(HcmContractBinding, EveryContractHasOneBindingThatTakesOnlyItsOwnTypes)
+{
+  const std::vector<BindingEntry> entries = MakeEveryBindingEntry();
   ASSERT_EQ(HcmContractBindingCount(), ContractDescriptorCount());
-  for (std::size_t i = 0; i < HcmContractBindingCount(); ++i) {
-    const HcmContractBinding * binding = HcmContractBindingAt(i);
-    ASSERT_NE(binding, nullptr);
-    ASSERT_NE(binding->descriptor, nullptr);
-    const std::string name(binding->descriptor->typeName);
-    EXPECT_EQ(FindHcmContractBinding(name), binding) << name;
-    EXPECT_NE(binding->acceptsDescriptor, nullptr) << name;
-    EXPECT_NE(binding->contractToHcm, nullptr) << name;
-    EXPECT_NE(binding->hcmToContract, nullptr) << name;
-    EXPECT_NE(binding->createDescriptor, nullptr) << name;
-  }
+  ASSERT_EQ(entries.size(), HcmContractBindingCount());
   EXPECT_EQ(HcmContractBindingAt(HcmContractBindingCount()), nullptr);
   EXPECT_EQ(FindHcmContractBinding("qrb.contract.unknown.v1.Missing"), nullptr);
 
-  // Descriptors are told apart by C++ type, so a created descriptor is
-  // accepted by its own binding and by no other, whatever its buffer type.
-  for (std::size_t i = 0; i < HcmContractBindingCount(); ++i) {
-    const HcmContractBinding & binding = *HcmContractBindingAt(i);
-    const std::string name(binding.descriptor->typeName);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const std::string & name = entries[i].contractType;
+    SCOPED_TRACE(name);
+    const HcmContractBinding * binding = FindHcmContractBinding(name);
+    ASSERT_NE(binding, nullptr);
+    EXPECT_EQ(binding, HcmContractBindingAt(i));
+    ASSERT_NE(binding->descriptor, nullptr);
+    ASSERT_NE(binding->acceptsDescriptor, nullptr);
+    ASSERT_NE(binding->contractToHcm, nullptr);
+    ASSERT_NE(binding->hcmToContract, nullptr);
+    ASSERT_NE(binding->createDescriptor, nullptr);
+
     std::unique_ptr<QC::Memory::QCBufferDescriptorBase_t> created;
-    ASSERT_EQ(CreateQrbBufferDescriptor(name, created), QC::QC_STATUS_OK) << name;
-    ASSERT_NE(created, nullptr) << name;
-    for (std::size_t j = 0; j < HcmContractBindingCount(); ++j) {
-      EXPECT_EQ(HcmContractBindingAt(j)->acceptsDescriptor(*created), i == j) << name;
+    ASSERT_EQ(CreateQrbBufferDescriptor(name, created), QC::QC_STATUS_OK);
+    ASSERT_NE(created, nullptr);
+    EXPECT_TRUE(binding->acceptsDescriptor(*created));
+
+    for (std::size_t j = 0; j < entries.size(); ++j) {
+      SCOPED_TRACE(entries[j].contractType);
+      EXPECT_EQ(binding->acceptsDescriptor(*entries[j].descriptor), i == j);
+      if (i == j)
+        continue;
+      EXPECT_FALSE(
+          binding->contractToHcm(*entries[i].contract, DmaBufView{}, *entries[j].descriptor));
+      EXPECT_FALSE(binding->hcmToContract(*entries[j].descriptor, *entries[i].contract));
+      EXPECT_FALSE(
+          binding->contractToHcm(*entries[j].contract, DmaBufView{}, *entries[i].descriptor));
+      EXPECT_FALSE(binding->hcmToContract(*entries[i].descriptor, *entries[j].contract));
     }
   }
 
@@ -63,158 +94,63 @@ TEST(HcmContractBinding, EveryContractHasOneCompleteBindingAndAMatchingFactory)
   EXPECT_EQ(CreateQrbBufferDescriptor("qrb.contract.unknown.v1.Missing", descriptor),
       QC::QC_STATUS_UNSUPPORTED);
   EXPECT_EQ(descriptor, nullptr);
-
-  // A binding never accepts or converts another Contract's descriptor.
-  const HcmContractBinding & pose = *FindHcmContractBinding(kPoseWithCovarianceStampedContractType);
-  PointCloudHcmDescriptor cloudDescriptor;
-  PoseHcmContract poseContract;
-  EXPECT_FALSE(pose.acceptsDescriptor(cloudDescriptor));
-  EXPECT_FALSE(pose.contractToHcm(poseContract, DmaBufView{}, cloudDescriptor));
-  EXPECT_FALSE(pose.hcmToContract(cloudDescriptor, poseContract));
-
-  // Inline Contracts do not take each other's descriptors, even when their shapes are similar.
-  const HcmContractBinding & odom = *FindHcmContractBinding(kOdometryContractType);
-  OdometryHcmDescriptor odomDescriptor;
-  PoseHcmDescriptor poseDescriptor;
-  OdometryHcmContract odomContract;
-  EXPECT_TRUE(odom.acceptsDescriptor(odomDescriptor));
-  EXPECT_FALSE(odom.acceptsDescriptor(poseDescriptor));
-  EXPECT_FALSE(pose.acceptsDescriptor(odomDescriptor));
-  EXPECT_FALSE(odom.contractToHcm(odomContract, DmaBufView{}, poseDescriptor));
-  EXPECT_FALSE(odom.hcmToContract(poseDescriptor, odomContract));
-
-  // Each Inline Contract binding rejects the other Inline descriptors.
-  const HcmContractBinding & twist = *FindHcmContractBinding(kTwistStampedContractType);
-  TwistHcmDescriptor twistDescriptor;
-  TwistHcmContract twistContract;
-  EXPECT_TRUE(twist.acceptsDescriptor(twistDescriptor));
-  EXPECT_FALSE(twist.acceptsDescriptor(odomDescriptor));
-  EXPECT_FALSE(odom.acceptsDescriptor(twistDescriptor));
-  EXPECT_FALSE(twist.contractToHcm(twistContract, DmaBufView{}, odomDescriptor));
-  EXPECT_FALSE(twist.hcmToContract(odomDescriptor, twistContract));
-
-  // Each Inline Contract binding rejects the other Inline descriptors.
-  const HcmContractBinding & tf = *FindHcmContractBinding(kTFMessageContractType);
-  TFMessageHcmDescriptor tfDescriptor;
-  TFMessageHcmContract tfContract;
-  EXPECT_TRUE(tf.acceptsDescriptor(tfDescriptor));
-  EXPECT_FALSE(tf.acceptsDescriptor(twistDescriptor));
-  EXPECT_FALSE(twist.acceptsDescriptor(tfDescriptor));
-  EXPECT_FALSE(tf.contractToHcm(tfContract, DmaBufView{}, twistDescriptor));
-  EXPECT_FALSE(tf.hcmToContract(twistDescriptor, tfContract));
-
-  // Image and PointCloud are both DMA-BUF Buffer descriptors; neither takes the other's.
-  const HcmContractBinding & image = *FindHcmContractBinding(kImageContractType);
-  const HcmContractBinding & cloud = *FindHcmContractBinding(kPointCloudContractType);
-  ImageHcmDescriptor imageDescriptor;
-  ImageHcmContract imageContract;
-  EXPECT_TRUE(image.acceptsDescriptor(imageDescriptor));
-  EXPECT_FALSE(image.acceptsDescriptor(cloudDescriptor));
-  EXPECT_FALSE(cloud.acceptsDescriptor(imageDescriptor));
-  EXPECT_FALSE(image.contractToHcm(imageContract, DmaBufView{}, cloudDescriptor));
-  EXPECT_FALSE(image.hcmToContract(cloudDescriptor, imageContract));
-
-  // The 2-D and 3-D detection descriptors share a base class and a buffer type, but a binding
-  // takes only its own.
-  const HcmContractBinding & detection2d = *FindHcmContractBinding(kDetection2DArrayContractType);
-  const HcmContractBinding & detection3d = *FindHcmContractBinding(kDetection3DArrayContractType);
-  Detection2DHcmDescriptor descriptor2d;
-  Detection3DHcmDescriptor descriptor3d;
-  Detection2DHcmContract contract2d;
-  Detection3DHcmContract contract3d;
-  EXPECT_TRUE(detection2d.acceptsDescriptor(descriptor2d));
-  EXPECT_FALSE(detection2d.acceptsDescriptor(descriptor3d));
-  EXPECT_TRUE(detection3d.acceptsDescriptor(descriptor3d));
-  EXPECT_FALSE(detection3d.acceptsDescriptor(descriptor2d));
-  EXPECT_FALSE(detection2d.contractToHcm(contract2d, DmaBufView{}, descriptor3d));
-  EXPECT_FALSE(detection2d.hcmToContract(descriptor3d, contract2d));
-  EXPECT_FALSE(detection3d.contractToHcm(contract3d, DmaBufView{}, descriptor2d));
-  EXPECT_FALSE(detection3d.hcmToContract(descriptor2d, contract3d));
-  EXPECT_FALSE(detection2d.contractToHcm(contract3d, DmaBufView{}, descriptor2d));
-  // JointState and TFMessage share CUSTOM_4, but their C++ descriptors are distinct.
-  const HcmContractBinding & joints = *FindHcmContractBinding(kJointStateContractType);
-  JointStateHcmDescriptor jointDescriptor;
-  JointStateHcmContract jointContract;
-  EXPECT_TRUE(joints.acceptsDescriptor(jointDescriptor));
-  EXPECT_FALSE(joints.acceptsDescriptor(tfDescriptor));
-  EXPECT_FALSE(tf.acceptsDescriptor(jointDescriptor));
-  EXPECT_FALSE(joints.contractToHcm(jointContract, DmaBufView{}, tfDescriptor));
-  EXPECT_FALSE(joints.hcmToContract(tfDescriptor, jointContract));
-
-  // Imu and Twist are both inline sensor contracts; neither takes the other's
-  // descriptor.
-  const HcmContractBinding & imu = *FindHcmContractBinding(kImuContractType);
-  ImuHcmDescriptor imuDescriptor;
-  ImuHcmContract imuContract;
-  EXPECT_TRUE(imu.acceptsDescriptor(imuDescriptor));
-  EXPECT_FALSE(imu.acceptsDescriptor(twistDescriptor));
-  EXPECT_FALSE(twist.acceptsDescriptor(imuDescriptor));
-  EXPECT_FALSE(imu.contractToHcm(imuContract, DmaBufView{}, twistDescriptor));
-  EXPECT_FALSE(imu.hcmToContract(twistDescriptor, imuContract));
 }
 
-namespace
+// The inherited buffer is classified before the CPU touches it; sync calls with an fd of -1
+// succeed without work.
+TEST(HcmDmaBuffer, ClassifiesTheInheritedBufferAndNoOpsSyncForFdMinusOne)
 {
+  char storage[64] = {};
+  int fd = 0;
 
-/** @brief One inline geometry Contract, and a Contract message and descriptor of its own. */
-struct GeometryEntry
-{
-  std::string_view contractType;
-  std::unique_ptr<google::protobuf::MessageLite> contract;
-  std::unique_ptr<QC::Memory::QCBufferDescriptorBase_t> descriptor;
-};
+  QC::Memory::QCBufferDescriptorBase_t base;
+  EXPECT_EQ(InspectHcmBuffer(base, fd), HcmBufferAccess::kNone);
+  EXPECT_EQ(fd, -1);
 
-template <typename ContractT, typename DescriptorT>
-GeometryEntry MakeGeometryEntry(std::string_view contractType)
-{
-  return GeometryEntry{
-      contractType, std::make_unique<ContractT>(), std::make_unique<DescriptorT>()};
-}
+  QC::Memory::BufferDescriptor_t buffer;
+  buffer.pBuf = nullptr;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kNone);
 
-}  // namespace
+  buffer.pBuf = storage;
+  buffer.size = sizeof(storage);
+  buffer.offset = 0;
+  buffer.allocatorType = QC::Memory::QC_MEMORY_ALLOCATOR_HEAP;
+  fd = 0;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kHostMemory);
+  EXPECT_EQ(fd, -1);
 
-// UT-HCM-02: the inline geometry Contracts share the value types of qrb_contracts, and some of
-// their descriptors a buffer type, but a binding takes only the descriptor and the Contract of
-// its own, whichever way it converts.
-TEST(HcmContractBinding, EveryGeometryBindingTakesOnlyItsOwnDescriptorAndContract)
-{
-  std::vector<GeometryEntry> entries;
-  entries.push_back(MakeGeometryEntry<PoseHcmContract, PoseHcmDescriptor>(
-      kPoseWithCovarianceStampedContractType));
-  entries.push_back(MakeGeometryEntry<PoseStampedHcmContract, PoseStampedHcmDescriptor>(
-      kPoseStampedContractType));
-  entries.push_back(
-      MakeGeometryEntry<PoseArrayHcmContract, PoseArrayHcmDescriptor>(kPoseArrayContractType));
-  entries.push_back(
-      MakeGeometryEntry<TwistHcmContract, TwistHcmDescriptor>(kTwistStampedContractType));
-  entries.push_back(
-      MakeGeometryEntry<TFMessageHcmContract, TFMessageHcmDescriptor>(kTFMessageContractType));
-  entries.push_back(MakeGeometryEntry<Vector3StampedHcmContract, Vector3StampedHcmDescriptor>(
-      kVector3StampedContractType));
-  entries.push_back(
-      MakeGeometryEntry<OdometryHcmContract, OdometryHcmDescriptor>(kOdometryContractType));
+  buffer.offset = sizeof(storage) + 1;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kUnusable);
+  buffer.offset = 0;
 
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const std::string name(entries[i].contractType);
-    const HcmContractBinding * binding = FindHcmContractBinding(name);
-    ASSERT_NE(binding, nullptr) << name;
-    for (std::size_t j = 0; j < entries.size(); ++j) {
-      const std::string other(entries[j].contractType);
-      EXPECT_EQ(binding->acceptsDescriptor(*entries[j].descriptor), i == j) << name << " " << other;
-      if (i == j)
-        continue;
-      // The descriptor of another Contract, in either direction.
-      EXPECT_FALSE(
-          binding->contractToHcm(*entries[i].contract, DmaBufView{}, *entries[j].descriptor))
-          << name << " " << other;
-      EXPECT_FALSE(binding->hcmToContract(*entries[j].descriptor, *entries[i].contract))
-          << name << " " << other;
-      // The message of another Contract, in either direction.
-      EXPECT_FALSE(
-          binding->contractToHcm(*entries[j].contract, DmaBufView{}, *entries[i].descriptor))
-          << name << " " << other;
-      EXPECT_FALSE(binding->hcmToContract(*entries[i].descriptor, *entries[j].contract))
-          << name << " " << other;
-    }
-  }
+  buffer.allocatorType = QC::Memory::QC_MEMORY_ALLOCATOR_DMA;
+  buffer.dmaHandle = 5;
+  buffer.pid = 0;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kLocalDmaBuf);
+  EXPECT_EQ(fd, 5);
+  buffer.pid = ::getpid();
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kLocalDmaBuf);
+
+  buffer.pid = ::getpid() + 1;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kUnusable);
+  EXPECT_EQ(fd, -1);
+  buffer.pid = 0;
+
+  // Any DMA allocator, not only the generic one.
+  buffer.allocatorType = QC::Memory::QC_MEMORY_ALLOCATOR_DMA_GPU;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kLocalDmaBuf);
+  EXPECT_EQ(fd, 5);
+  buffer.allocatorType = QC::Memory::QC_MEMORY_ALLOCATOR_DMA;
+
+  buffer.dmaHandle = static_cast<std::uint64_t>(INT_MAX) + 1;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kUnusable);
+  buffer.dmaHandle = 5;
+
+  buffer.allocatorType = QC::Memory::QC_MEMORY_ALLOCATOR_LAST;
+  EXPECT_EQ(InspectHcmBuffer(buffer, fd), HcmBufferAccess::kUnusable);
+
+  EXPECT_EQ(BeginDmaBufCpuRead(-1), Status::kOk);
+  EXPECT_EQ(EndDmaBufCpuRead(-1), Status::kOk);
+  EXPECT_EQ(BeginDmaBufCpuWrite(-1), Status::kOk);
+  EXPECT_EQ(EndDmaBufCpuWrite(-1), Status::kOk);
 }
