@@ -22,6 +22,8 @@
 //   payload_bytes : (optional) a sender's payload in the buffer, for a DmaBuf Contract
 //                   (PointCloud2; ImageLayout sends the rgb8 rows that fit); others ignore
 //                   it, default 1048576
+//   image_width   : (optional) width of an ImageLayout image, the same on both sides,
+//                   default 1928
 //   pool_size     : (optional) frames a sender cycles through, 1..32, default 4
 //   warmup        : (optional) seconds a receiver does not measure, default 0
 //
@@ -107,6 +109,7 @@ QCStatus_e SampleStreamProbe::Init(std::string name, SampleConfig_t & config)
   fps_ = Get(config, "fps", static_cast<std::uint32_t>(30));
   const std::uint32_t payloadBytes =
       Get(config, "payload_bytes", static_cast<std::uint32_t>(1048576));
+  const std::uint32_t imageWidth = Get(config, "image_width", sp::kDefaultProbeImageWidth);
   const std::uint32_t poolSize = Get(config, "pool_size", static_cast<std::uint32_t>(4));
   const float warmup = Get(config, "warmup", 0.0f);
   inputTopic_ = Get(config, "input_topic", "");
@@ -145,6 +148,7 @@ QCStatus_e SampleStreamProbe::Init(std::string name, SampleConfig_t & config)
               {"contract", flow_.contract},
               {"topic", flow_.topic},
               {"payload_bytes", payloadBytes},
+              {"image_width", imageWidth},
               {"warmup", warmup},
               {"globalBufferIdMap", {{{"name", "Probe"}, {"id", flow_.globalBufferId}}}},
           }},

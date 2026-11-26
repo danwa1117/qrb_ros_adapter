@@ -912,7 +912,7 @@ private:
 // --- sensor.v1.ImageLayout (DMA-BUF) ------------------------------------------
 
 /**
- * A kProbeImageWidth x ProbeImageHeight( payload_bytes ) rgb8 image in the
+ * A ProbeImageWidth() x ProbeImageHeight( payload_bytes ) rgb8 image in the
  * layout qrb_ros_transport allocates, taken from qrb_ros_transport itself so
  * the Adapter's copy of that rule is checked too. Its stamp is ROS time, which
  * the Adapter converts to and from the camera qtimer.
@@ -931,8 +931,8 @@ struct RosProbeSample<adapter::ImageRosMessage>
     Source(std::uint64_t payloadBytes, std::uint32_t depth, std::uint32_t streamTag)
       : streamTag_(streamTag)
       , height_(ProbeImageHeight(payloadBytes))
-      , layout_(TransportLayout(kProbeImageWidth, height_, kEncoding))
-      , pool_(StorageBytes(kProbeImageWidth, height_, kEncoding),
+      , layout_(TransportLayout(ProbeImageWidth(), height_, kEncoding))
+      , pool_(StorageBytes(ProbeImageWidth(), height_, kEncoding),
             depth + 4u,
             streamTag,
             [layout = layout_, streamTag](
@@ -941,7 +941,7 @@ struct RosProbeSample<adapter::ImageRosMessage>
       if (height_ == 0)
         throw std::invalid_argument(
             "'payload_bytes' of ImageLayout must hold at least one row of " +
-            std::to_string(kProbeImageHcmStride) + " bytes");
+            std::to_string(ProbeImageHcmStride()) + " bytes");
       std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buffer;
       DmaPayloadPool::Slot * slot = nullptr;
       if (pool_.Acquire(buffer, slot) != SendOutcome::kSent)
@@ -960,7 +960,7 @@ struct RosProbeSample<adapter::ImageRosMessage>
         return acquired;
 
       auto image = std::make_unique<Message>(Message());
-      image->width = static_cast<int>(kProbeImageWidth);
+      image->width = static_cast<int>(ProbeImageWidth());
       image->height = static_cast<int>(height_);
       image->encoding = kEncoding;
       image->dmabuf = std::move(buffer);
@@ -1022,7 +1022,7 @@ struct RosProbeSample<adapter::ImageRosMessage>
     // qtimer the Adapter converted to ROS time.
     const std::uint64_t stamp = static_cast<std::uint64_t>(image.header.stamp.sec) * 1000000000ull +
                                 image.header.stamp.nanosec;
-    if (image.encoding != kEncoding || image.width != static_cast<int>(kProbeImageWidth) ||
+    if (image.encoding != kEncoding || image.width != static_cast<int>(ProbeImageWidth()) ||
         !image.header.frame_id.empty() || image.header.stamp.sec < 0 ||
         !WithinNs(stamp, RealtimeNowNs(), kStampToleranceNs))
       reading.check = FrameCheck::kBadLayout;
@@ -1268,6 +1268,7 @@ constexpr ParamHelp kParamHelp[] = {
     {"fps", "frames per second of a sender, 0: unlimited"},
     {"payload_bytes", "payload of each frame this side sends"},
     {"buffer_bytes", "DMA buffer size of the HCM receiver (R2H); ignored on this side"},
+    {"image_width", "width of an ImageLayout image, the same on both sides"},
     {"duration", "seconds to run, 0: until unloaded or a signal"},
     {"warmup", "seconds a receiver does not measure"},
     {"log",
@@ -1780,6 +1781,8 @@ void RosStreamProbeNode::LoadParams()
 
   params_ = params;
   flow_ = flow;
+  // The ImageLayout sample of either direction uses it.
+  ProbeImageWidth().store(params.imageWidth);
   DeclareEffectiveParams(paramsFile);
 }
 

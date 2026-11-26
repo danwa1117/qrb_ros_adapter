@@ -865,8 +865,8 @@ private:
 // --- sensor.v1.ImageLayout (DMA-BUF) ------------------------------------------
 
 /**
- * A kProbeImageWidth x ProbeImageHeight( payload_bytes ) rgb8 Camera frame,
- * whose rows are kProbeImageHcmStride apart as the QCNode Camera sample
+ * A ProbeImageWidth() x ProbeImageHeight( payload_bytes ) rgb8 Camera frame,
+ * whose rows are ProbeImageHcmStride() apart as the QCNode Camera sample
  * allocates them. Its timestamp is the camera qtimer, which the Adapter
  * converts to and from ROS time.
  */
@@ -882,18 +882,18 @@ struct HcmProbeSample<adapter::ImageHcmDescriptor>
     if (ProbeImageHeight(payloadBytes) > 0)
       return {};
     return "'payload_bytes' of ImageLayout must hold at least one row of " +
-           std::to_string(kProbeImageHcmStride) + " bytes";
+           std::to_string(ProbeImageHcmStride()) + " bytes";
   }
 
   static std::uint64_t SentBytes(const HcmSenderState & state)
   {
-    return kProbeImageRowBytes * ProbeImageHeight(state.payloadBytes);
+    return ProbeImageRowBytes() * ProbeImageHeight(state.payloadBytes);
   }
 
   static HcmStampResult Stamp(Descriptor & image, HcmSenderState & state, std::uint64_t sequence)
   {
     const std::uint32_t height = ProbeImageHeight(state.payloadBytes);
-    const std::uint64_t storage = kProbeImageHcmStride * height;
+    const std::uint64_t storage = ProbeImageHcmStride() * height;
     if (image.pBuf == nullptr || image.offset > image.size || image.size - image.offset < storage)
       return HcmStampResult::kBadBuffer;
     auto * data = static_cast<std::uint8_t *>(image.GetDataPtr());
@@ -902,7 +902,7 @@ struct HcmProbeSample<adapter::ImageHcmDescriptor>
       return HcmStampResult::kBadBuffer;
 
     image.format = QC::QC_IMAGE_FORMAT_RGB888;
-    image.width = kProbeImageWidth;
+    image.width = ProbeImageWidth();
     image.height = height;
     image.batchSize = 1;
     image.numPlanes = 1;
@@ -911,7 +911,7 @@ struct HcmProbeSample<adapter::ImageHcmDescriptor>
       image.actualHeight[i] = 0;
       image.planeBufSize[i] = 0;
     }
-    image.stride[0] = static_cast<std::uint32_t>(kProbeImageHcmStride);
+    image.stride[0] = static_cast<std::uint32_t>(ProbeImageHcmStride());
     image.actualHeight[0] = height;
     image.planeBufSize[0] = static_cast<std::uint32_t>(storage);
     const ProbeImageLayout layout = LayoutOf(image);
@@ -965,7 +965,7 @@ struct HcmProbeSample<adapter::ImageHcmDescriptor>
     }
     // The sender is the ROS probe: its rgb8 image, stamped with ROS time, which
     // the Adapter converted to the qtimer.
-    if (image.format != QC::QC_IMAGE_FORMAT_RGB888 || image.width != kProbeImageWidth ||
+    if (image.format != QC::QC_IMAGE_FORMAT_RGB888 || image.width != ProbeImageWidth() ||
         !WithinNs(image.timestamp, adapter::SampleHcmClocks().qtimerNs, kStampToleranceNs))
       reading.check = FrameCheck::kBadLayout;
     return reading;
@@ -1280,6 +1280,7 @@ struct ProbeNodeSettings
   const ContractOps * contract{nullptr};
   std::string topic{ProbeFlow{}.topic};
   std::uint64_t payloadBytes{ProbeParams{}.payloadBytes};
+  std::uint32_t imageWidth{ProbeParams{}.imageWidth};
   double warmup{0.0};
   std::uint32_t globalBufferId{0};
 };
@@ -1305,6 +1306,7 @@ QC::QCStatus_e ParseSettings(const std::string & json,
     settings.id = node.value("id", settings.id);
     settings.topic = node.value("topic", settings.topic);
     settings.payloadBytes = node.value("payload_bytes", settings.payloadBytes);
+    settings.imageWidth = node.value("image_width", settings.imageWidth);
     settings.warmup = node.value("warmup", settings.warmup);
     if (node.contains("globalBufferIdMap"))
       settings.globalBufferId = node["globalBufferIdMap"].at(0).at("id").get<std::uint32_t>();
@@ -1319,6 +1321,12 @@ QC::QCStatus_e ParseSettings(const std::string & json,
         "unsupported \"contract\" " + contract + "; supported: " + SupportedContracts() + "; ";
     return QC::QC_STATUS_UNSUPPORTED;
   }
+  if (settings.imageWidth == 0 || settings.imageWidth > kMaxProbeImageWidth) {
+    errors += "\"image_width\" must be in [1, " + std::to_string(kMaxProbeImageWidth) + "]; ";
+    return QC::QC_STATUS_BAD_ARGUMENTS;
+  }
+  // The ImageLayout sample of either direction, and the payload check below, use it.
+  ProbeImageWidth().store(settings.imageWidth);
   if (settings.sender) {
     const std::string why = settings.contract->checkPayloadBytes(settings.payloadBytes);
     if (!why.empty()) {

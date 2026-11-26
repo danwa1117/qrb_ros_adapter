@@ -111,6 +111,7 @@ ROS probe of the [Test](#test) takes `<setting>:=<value>` on its launch.
 | `input_topic` / `output_topic` | | IpcAdapter, StreamProbe: takes frames from / gives frames to another sample. |
 | `fps` | `30` | All: frames per second a sender sends, `0` for no pause. |
 | `payload_bytes` | `1048576` | All: DMA-BUF payload of a DmaBuf Contract a sender sends. |
+| `image_width` | `1928` | All: width of an ImageLayout image, the same on both sides; its height is the rows of `ALIGN(image_width * 3, 16)` bytes that `payload_bytes` holds. |
 | `duration` | `0` | ROS probe: seconds to run, `0` until stopped. |
 | `log` | | ROS probe: text log file. |
 

@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <cerrno>
 #include <cmath>
@@ -228,16 +229,36 @@ inline FrameReading CheckFrame(const std::uint8_t * data, std::size_t size, std:
 // two as well as the bytes.
 //
 
-/** @brief Width of a probe image: not a multiple of 128, so the two sides' strides differ. */
-constexpr std::uint32_t kProbeImageWidth = 1928;
-constexpr std::uint64_t kProbeImageRowBytes = kProbeImageWidth * 3;  // rgb8
+/** @brief Default probe image width: not a multiple of 128, so the two sides' strides differ. */
+constexpr std::uint32_t kDefaultProbeImageWidth = 1928;
+constexpr std::uint32_t kMaxProbeImageWidth = 65535;
+
+/**
+ * @brief Width of the probe images of this process, from the `image_width` setting. One
+ * for the process, set when the probe reads its settings: a sender sends images this wide,
+ * a receiver expects them, so both sides are given the same width.
+ */
+inline std::atomic<std::uint32_t> & ProbeImageWidth()
+{
+  static std::atomic<std::uint32_t> width{kDefaultProbeImageWidth};
+  return width;
+}
+
+inline std::uint64_t ProbeImageRowBytes()
+{
+  return std::uint64_t{ProbeImageWidth().load()} * 3;  // rgb8
+}
+
 /** @brief The HCM row stride, ALIGN(width * 3, 16) as the QCNode Camera sample uses for rgb8. */
-constexpr std::uint64_t kProbeImageHcmStride = (kProbeImageRowBytes + 15) / 16 * 16;
+inline std::uint64_t ProbeImageHcmStride()
+{
+  return (ProbeImageRowBytes() + 15) / 16 * 16;
+}
 
 /** @brief Rows of a probe image whose HCM storage fits `payloadBytes`; 0 if none fits. */
 inline std::uint32_t ProbeImageHeight(std::uint64_t payloadBytes)
 {
-  return static_cast<std::uint32_t>(payloadBytes / kProbeImageHcmStride);
+  return static_cast<std::uint32_t>(payloadBytes / ProbeImageHcmStride());
 }
 
 /** @brief Where the valid rows of one plane lie in a buffer. */
@@ -1022,6 +1043,7 @@ struct ProbeParams
   double fps{30.0};                      // frames per second, 0: unlimited
   std::uint64_t payloadBytes{1u << 20};  // what a sender sends per frame
   std::uint64_t bufferBytes{32u << 20};  // DMA buffer size of the HCM receiver (R2H)
+  std::uint32_t imageWidth{kDefaultProbeImageWidth};  // of an ImageLayout image, both sides
   double duration{0.0};                  // seconds, 0: until stopped
   double warmup{0.0};                    // seconds
   std::string log;                       // text log file, empty: none
@@ -1097,7 +1119,11 @@ inline void ApplyJson(ProbeParams & params,
       params.payloadBytes = unsignedValue(key, value, std::numeric_limits<std::uint32_t>::max());
     else if (key == "buffer_bytes")
       params.bufferBytes = unsignedValue(key, value, std::numeric_limits<std::uint32_t>::max());
-    else if (key == "duration")
+    else if (key == "image_width") {
+      if (unsignedValue(key, value, kMaxProbeImageWidth) == 0)
+        fail(key, "positive");
+      params.imageWidth = value.get<std::uint32_t>();
+    } else if (key == "duration")
       params.duration = nonNegative(key, value);
     else if (key == "warmup")
       params.warmup = nonNegative(key, value);
@@ -1147,6 +1173,7 @@ inline nlohmann::json ToJson(const ProbeParams & params)
       {"fps", params.fps},
       {"payload_bytes", params.payloadBytes},
       {"buffer_bytes", params.bufferBytes},
+      {"image_width", params.imageWidth},
       {"duration", params.duration},
       {"warmup", params.warmup},
       {"log", params.log},
